@@ -644,8 +644,27 @@ def main() -> None:
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
+<<<<<<< HEAD
     plt.tight_layout()
     save_fig("06_training_curves.png")
+=======
+plt.tight_layout()
+save_fig("06_training_curves.png")
+
+model_path = os.path.join(OUTPUT_DIR, "churn_model.pkl")
+with open(model_path, "wb") as f:
+    pickle.dump(
+        {
+            "model": final_model,
+            "scaler": scaler,
+            "feature_names": feature_names,
+            "optimal_threshold": optimal_threshold,
+            "best_params": best_params,
+        },
+        f,
+    )
+print(f" Saved model → {model_path}")
+>>>>>>> ef07e5c05478ef55feb8eae57655a888219f0401
 
     # ── 4.7  Evaluation ───────────────────────────────────────────────────────
     print("\n" + "=" * 65)
