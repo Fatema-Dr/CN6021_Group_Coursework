@@ -1,0 +1,1585 @@
+"""
+task2_brain_tumour_segmentation.py
+===================================
+CN6021 — Advanced Topics in AI and Data Science
+Task 2: 3D Brain Tumour Segmentation from MRI Scans
+
+Architecture : 3D U-Net (encoder–decoder with skip connections)
+Framework    : PyTorch
+Dataset      : BraTS 2020  (or compatible NIfTI dataset)
+               Expected layout:
+                 data/
+                   BraTS2020_TrainingData/
+                     BraTS20_Training_001/
+                       BraTS20_Training_001_flair.nii.gz
+                       BraTS20_Training_001_t1.nii.gz
+                       BraTS20_Training_001_t1ce.nii.gz
+                       BraTS20_Training_001_t2.nii.gz
+                       BraTS20_Training_001_seg.nii.gz
+                     ...
+
+Pipeline
+--------
+ 1.  Configuration & reproducibility
+ 2.  3D data augmentation (rotations, flips, elastic deformations, intensity)
+ 3.  Custom Dataset + DataLoader (patch-based, memory-efficient)
+ 4.  3D U-Net architecture
+ 5.  Loss functions  (Dice, Focal, combined Dice+BCE)
+ 6.  Evaluation metrics (Dice, IoU, Hausdorff distance)
+ 7.  Training loop  (GPU, AMP mixed precision, gradient clipping)
+ 8.  Hyperparameter grid search
+ 9.  Transfer-learning helpers (2-D → 3-D weight inflation)
+10.  Results, visualisations, model checkpoint saving
+
+Outputs (all written to  outputs/ )
+--------------------------------------
+  checkpoints/best_model.pth          best validation-Dice checkpoint
+  checkpoints/final_model.pth         weights after all epochs
+  results/training_curves.png
+  results/dice_per_class.png
+  results/sample_predictions/         slice visualisations for N test cases
+  results/metrics_summary.csv
+  results/hyperparameter_search.csv
+
+Usage
+-----
+  # full training run
+  python task2_brain_tumour_segmentation.py
+
+  # quick smoke-test with synthetic data (no BraTS needed)
+  python task2_brain_tumour_segmentation.py --synthetic
+
+  # evaluate a saved checkpoint
+  python task2_brain_tumour_segmentation.py --eval --checkpoint outputs/checkpoints/best_model.pth
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.  Standard library & third-party imports
+# ─────────────────────────────────────────────────────────────────────────────
+import os
+import sys
+import csv
+import time
+import math
+import random
+import argparse
+import warnings
+from pathlib import Path
+from typing  import Dict, List, Optional, Tuple
+
+warnings.filterwarnings("ignore")
+
+import numpy  as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")          # headless – no display required
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from   matplotlib.colors import ListedColormap
+
+import torch
+import torch.nn            as nn
+import torch.nn.functional as F
+from   torch.utils.data   import Dataset, DataLoader
+from   torch.cuda.amp     import GradScaler, autocast
+from   torch.optim        import AdamW
+from   torch.optim.lr_scheduler import CosineAnnealingLR
+
+# nibabel for NIfTI I/O  (pip install nibabel)
+try:
+    import nibabel as nib
+    NIBABEL_AVAILABLE = True
+except ImportError:
+    NIBABEL_AVAILABLE = False
+    print("WARNING: nibabel not found. Real BraTS data cannot be loaded.")
+    print("         Install with:  pip install nibabel")
+    print("         Continuing with synthetic data mode.\n")
+
+# scipy for elastic deformation & Hausdorff distance
+try:
+    from scipy.ndimage          import map_coordinates, gaussian_filter
+    from scipy.spatial.distance import directed_hausdorff
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("WARNING: scipy not found. Elastic deformation & Hausdorff disabled.")
+    print("         Install with:  pip install scipy\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+class Config:
+    # ── Paths ──────────────────────────────────────────────────────────────────
+    DATA_ROOT      = Path("data/BraTS2020_TrainingData")
+    OUTPUT_DIR     = Path("outputs")
+    CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+    RESULTS_DIR    = OUTPUT_DIR / "results"
+    PRED_DIR       = RESULTS_DIR / "sample_predictions"
+
+    # ── Data ───────────────────────────────────────────────────────────────────
+    MODALITIES     = ["flair", "t1ce"]   # use FLAIR + T1ce (most informative)
+    IN_CHANNELS    = len(MODALITIES)     # 2
+    # BraTS segmentation labels:
+    #   0 = background, 1 = necrotic core, 2 = oedema, 4 = enhancing tumour
+    # We merge into 3 foreground classes + background  → 4 output channels
+    NUM_CLASSES    = 4
+    CLASS_NAMES    = ["Background", "Necrotic Core", "Oedema", "Enhancing"]
+    LABEL_REMAP    = {0: 0, 1: 1, 2: 2, 4: 3}   # remap label-4 → 3
+
+    # ── Patch-based training ───────────────────────────────────────────────────
+    PATCH_SIZE     = (96, 96, 96)        # D × H × W  (128³ needs ≥16 GB VRAM)
+    PATCHES_PER_VOL = 2                  # patches sampled per volume per epoch
+    FOREGROUND_PROB = 0.75               # prob that patch centre is a tumour voxel
+
+    # ── Model ──────────────────────────────────────────────────────────────────
+    BASE_FILTERS   = 16                  # first encoder stage; doubles each level
+    DEPTH          = 4                   # encoder levels (4 → 5 resolution scales)
+    DROPOUT        = 0.1
+
+    # ── Training ───────────────────────────────────────────────────────────────
+    EPOCHS         = 50
+    BATCH_SIZE     = 1                   # limited by GPU VRAM for 128³ patches
+    LR             = 1e-3
+    WEIGHT_DECAY   = 1e-5
+    GRAD_CLIP      = 1.0
+    AMP            = True                # automatic mixed precision
+    VAL_SPLIT      = 0.15
+    TEST_SPLIT     = 0.15
+    PATIENCE       = 15                  # early stopping patience (val Dice)
+    NUM_WORKERS    = 0                   # set >0 if your system allows fork
+
+    # ── Loss ───────────────────────────────────────────────────────────────────
+    DICE_WEIGHT    = 0.6
+    BCE_WEIGHT     = 0.4
+    FOCAL_GAMMA    = 2.0
+
+    # ── Augmentation ───────────────────────────────────────────────────────────
+    AUG_FLIP_PROB     = 0.5
+    AUG_ROTATE_PROB   = 0.3
+    AUG_ELASTIC_PROB  = 0.2
+    AUG_INTENSITY_PROB= 0.3
+
+    # ── Reproducibility ────────────────────────────────────────────────────────
+    SEED           = 42
+
+    # ── Misc ───────────────────────────────────────────────────────────────────
+    DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+    SAVE_VIS_N     = 5                   # number of test cases to visualise
+
+
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
+def make_dirs() -> None:
+    for d in [Config.CHECKPOINT_DIR, Config.RESULTS_DIR, Config.PRED_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  3D Data Augmentation
+# ─────────────────────────────────────────────────────────────────────────────
+class Augment3D:
+    """
+    Volumetric augmentation applied identically to image and label tensors.
+    All operations work on numpy arrays of shape (C, D, H, W) for images
+    and (D, H, W) for labels.
+    """
+
+    def __init__(self, cfg: Config = Config):
+        self.cfg = cfg
+
+    # ── Random axis-aligned flips ──────────────────────────────────────────────
+    @staticmethod
+    def random_flip(img: np.ndarray, lbl: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        for axis in [1, 2, 3]:           # D, H, W axes of (C,D,H,W)
+            if random.random() < 0.5:
+                img = np.flip(img, axis=axis).copy()
+                lbl = np.flip(lbl, axis=axis - 1).copy()   # lbl is (D,H,W)
+        return img, lbl
+
+    # ── Random 90° rotations in the axial plane ────────────────────────────────
+    @staticmethod
+    def random_rotate90(img: np.ndarray, lbl: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        k = random.randint(0, 3)
+        if k > 0:
+            img = np.rot90(img, k=k, axes=(2, 3)).copy()   # H–W plane
+            lbl = np.rot90(lbl, k=k, axes=(1, 2)).copy()
+        return img, lbl
+
+    # ── Elastic deformation ────────────────────────────────────────────────────
+    @staticmethod
+    def elastic_deform(
+        img: np.ndarray,
+        lbl: np.ndarray,
+        alpha: float = 40.0,
+        sigma: float = 6.0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Simulates tissue deformation: random displacement fields are smoothed
+        with a Gaussian kernel and applied via map_coordinates interpolation.
+        """
+        if not SCIPY_AVAILABLE:
+            return img, lbl
+
+        shape = lbl.shape                # (D, H, W)
+        dx = gaussian_filter(
+            (np.random.rand(*shape) * 2 - 1), sigma=sigma
+        ) * alpha
+        dy = gaussian_filter(
+            (np.random.rand(*shape) * 2 - 1), sigma=sigma
+        ) * alpha
+        dz = gaussian_filter(
+            (np.random.rand(*shape) * 2 - 1), sigma=sigma
+        ) * alpha
+
+        d, h, w    = shape
+        z, y, x    = np.meshgrid(np.arange(d), np.arange(h), np.arange(w),
+                                  indexing="ij")
+        indices    = (np.clip(z + dz, 0, d - 1).ravel(),
+                      np.clip(y + dy, 0, h - 1).ravel(),
+                      np.clip(x + dx, 0, w - 1).ravel())
+
+        # Deform each modality channel
+        img_def = np.stack([
+            map_coordinates(img[c], indices, order=1, mode="reflect"
+                            ).reshape(shape)
+            for c in range(img.shape[0])
+        ])
+        lbl_def = map_coordinates(lbl.astype(float), indices,
+                                   order=0, mode="reflect").reshape(shape)
+        return img_def, lbl_def.astype(lbl.dtype)
+
+    # ── Intensity augmentation (image only) ────────────────────────────────────
+    @staticmethod
+    def intensity_augment(img: np.ndarray) -> np.ndarray:
+        """
+        Random brightness shift + contrast scaling per channel.
+        Simulates scanner variability between acquisition sites.
+        """
+        for c in range(img.shape[0]):
+            shift   = np.random.uniform(-0.1, 0.1)
+            scale   = np.random.uniform(0.9,  1.1)
+            noise   = np.random.normal(0, 0.02, size=img[c].shape)
+            img[c]  = img[c] * scale + shift + noise
+        return img
+
+    def __call__(
+        self,
+        img: np.ndarray,
+        lbl: np.ndarray,
+        training: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if not training:
+            return img, lbl
+        if random.random() < self.cfg.AUG_FLIP_PROB:
+            img, lbl = self.random_flip(img, lbl)
+        if random.random() < self.cfg.AUG_ROTATE_PROB:
+            img, lbl = self.random_rotate90(img, lbl)
+        if random.random() < self.cfg.AUG_ELASTIC_PROB:
+            img, lbl = self.elastic_deform(img, lbl)
+        if random.random() < self.cfg.AUG_INTENSITY_PROB:
+            img = self.intensity_augment(img)
+        return img, lbl
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Dataset  (real BraTS  OR  synthetic for smoke-testing)
+# ─────────────────────────────────────────────────────────────────────────────
+def normalise_volume(vol: np.ndarray) -> np.ndarray:
+    """
+    Z-score normalisation per channel using non-zero voxel statistics.
+    Non-zero masking avoids skull-stripping artefacts skewing the stats.
+    """
+    mask = vol > 0
+    if mask.sum() == 0:
+        return vol
+    mu  = vol[mask].mean()
+    std = vol[mask].std() + 1e-8
+    out = np.zeros_like(vol, dtype=np.float32)
+    out[mask] = (vol[mask] - mu) / std
+    return out
+
+
+def remap_labels(seg: np.ndarray, mapping: Dict[int, int]) -> np.ndarray:
+    """Convert BraTS label values {0,1,2,4} → {0,1,2,3}."""
+    out = np.zeros_like(seg)
+    for src, dst in mapping.items():
+        out[seg == src] = dst
+    return out
+
+
+class BraTSDataset(Dataset):
+    """
+    Patch-based 3D Dataset for BraTS-style NIfTI data.
+
+    Each __getitem__ returns a randomly sampled 3-D patch of size
+    Config.PATCH_SIZE from one patient volume, together with the
+    corresponding label patch.
+
+    Foreground-biased sampling:  with probability FOREGROUND_PROB the patch
+    centre is placed on a tumour voxel, ensuring the model sees enough
+    positive examples despite the severe class imbalance.
+    """
+
+    def __init__(
+        self,
+        patient_dirs: List[Path],
+        cfg:          Config     = Config,
+        augment:      bool       = False,
+    ) -> None:
+        self.patient_dirs = patient_dirs
+        self.cfg          = cfg
+        self.augment      = augment
+        self.aug          = Augment3D(cfg)
+        self.patch_size   = np.array(cfg.PATCH_SIZE)
+
+    def __len__(self) -> int:
+        return len(self.patient_dirs) * self.cfg.PATCHES_PER_VOL
+
+    def _load_patient(self, patient_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
+        """Load and normalise all modality volumes + segmentation mask."""
+        name   = patient_dir.name
+        imgs   = []
+        for mod in self.cfg.MODALITIES:
+            nii_path = patient_dir / f"{name}_{mod}.nii.gz"
+            if not nii_path.exists():
+                nii_path = patient_dir / f"{name}_{mod}.nii"
+            vol = nib.load(str(nii_path)).get_fdata(dtype=np.float32)
+            imgs.append(normalise_volume(vol))
+        img = np.stack(imgs, axis=0)                       # (C, D, H, W)
+
+        seg_path = patient_dir / f"{name}_seg.nii.gz"
+        if not seg_path.exists():
+            seg_path = patient_dir / f"{name}_seg.nii"
+        seg = nib.load(str(seg_path)).get_fdata().astype(np.int64)
+        seg = remap_labels(seg, self.cfg.LABEL_REMAP)      # (D, H, W)
+
+        return img, seg
+
+    def _sample_patch_centre(
+        self, seg: np.ndarray
+    ) -> Tuple[int, int, int]:
+        """
+        Sample a valid patch centre.  With probability FOREGROUND_PROB,
+        the centre is chosen from tumour voxels (foreground-biased sampling).
+        """
+        ps   = self.patch_size // 2
+        d, h, w = seg.shape
+        low  = ps
+        high = np.array([d, h, w]) - ps
+
+        # Guard: ensure volume is large enough for the patch
+        high = np.maximum(high, low + 1)
+
+        if random.random() < self.cfg.FOREGROUND_PROB:
+            fg_coords = np.argwhere(seg > 0)
+            if len(fg_coords) > 0:
+                centre = fg_coords[random.randint(0, len(fg_coords) - 1)]
+                centre = np.clip(centre, low, high - 1)
+                return tuple(centre)
+
+        return tuple(np.random.randint(low, high))
+
+    def _extract_patch(
+        self,
+        img: np.ndarray,
+        seg: np.ndarray,
+        centre: Tuple[int, int, int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        ps    = self.patch_size // 2
+        z0, y0, x0 = centre
+        slices_img = (
+            slice(None),
+            slice(z0 - ps[0], z0 + ps[0]),
+            slice(y0 - ps[1], y0 + ps[1]),
+            slice(x0 - ps[2], x0 + ps[2]),
+        )
+        slices_seg = (
+            slice(z0 - ps[0], z0 + ps[0]),
+            slice(y0 - ps[1], y0 + ps[1]),
+            slice(x0 - ps[2], x0 + ps[2]),
+        )
+        return img[slices_img].copy(), seg[slices_seg].copy()
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        patient_idx = idx % len(self.patient_dirs)
+        patient_dir = self.patient_dirs[patient_idx]
+
+        if NIBABEL_AVAILABLE:
+            img, seg = self._load_patient(patient_dir)
+        else:
+            # Fallback: synthetic volume
+            img, seg = make_synthetic_volume(self.cfg)
+
+        centre      = self._sample_patch_centre(seg)
+        img_p, seg_p = self._extract_patch(img, seg, centre)
+
+        # Pad if the volume was smaller than the patch size
+        img_p, seg_p = self._pad_to_patch(img_p, seg_p)
+
+        # Augmentation
+        img_p, seg_p = self.aug(img_p, seg_p, training=self.augment)
+
+        return {
+            "image": torch.from_numpy(img_p.astype(np.float32)),
+            "label": torch.from_numpy(seg_p.astype(np.int64)),
+        }
+
+    def _pad_to_patch(
+        self,
+        img: np.ndarray,
+        seg: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        target = self.patch_size
+        pad_d  = max(0, target[0] - img.shape[1])
+        pad_h  = max(0, target[1] - img.shape[2])
+        pad_w  = max(0, target[2] - img.shape[3])
+        if pad_d + pad_h + pad_w > 0:
+            img = np.pad(img, ((0,0),(0,pad_d),(0,pad_h),(0,pad_w)))
+            seg = np.pad(seg, ((0,pad_d),(0,pad_h),(0,pad_w)))
+        return img[:, :target[0], :target[1], :target[2]], \
+               seg[:target[0], :target[1], :target[2]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b.  Synthetic dataset (no BraTS required — for testing)
+# ─────────────────────────────────────────────────────────────────────────────
+def make_synthetic_volume(
+    cfg: Config = Config,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Creates a random synthetic brain-like volume with a spherical tumour.
+    Used when BraTS data is unavailable (--synthetic flag).
+    """
+    size = 160
+    img  = np.random.randn(cfg.IN_CHANNELS, size, size, size).astype(np.float32)
+    seg  = np.zeros((size, size, size), dtype=np.int64)
+
+    # Add a simulated tumour sphere
+    cx, cy, cz = [random.randint(60, 100)] * 3
+    r_outer    = random.randint(15, 25)
+    r_inner    = r_outer // 2
+
+    zz, yy, xx = np.ogrid[:size, :size, :size]
+    dist        = np.sqrt((zz-cz)**2 + (yy-cy)**2 + (xx-cx)**2)
+
+    oedema_mask   = (dist < r_outer) & (dist >= r_inner)
+    necrotic_mask = dist < r_inner
+
+    seg[oedema_mask]   = 2
+    seg[necrotic_mask] = 1
+
+    # Simulate signal intensities for tumour regions
+    for c in range(cfg.IN_CHANNELS):
+        img[c][oedema_mask]   += 2.0 + np.random.randn() * 0.3
+        img[c][necrotic_mask] += 3.5 + np.random.randn() * 0.3
+
+    return img, seg
+
+
+class SyntheticDataset(Dataset):
+    """Generates synthetic volumes on-the-fly. No disk I/O needed."""
+
+    def __init__(
+        self,
+        n_samples: int  = 20,
+        cfg:       Config = Config,
+        augment:   bool  = False,
+    ) -> None:
+        self.n_samples = n_samples
+        self.cfg       = cfg
+        self.augment   = augment
+        self.aug       = Augment3D(cfg)
+
+    def __len__(self) -> int:
+        return self.n_samples
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        img, seg = make_synthetic_volume(self.cfg)
+
+        # Crop to PATCH_SIZE
+        ps      = np.array(self.cfg.PATCH_SIZE)
+        starts  = [(s - p) // 2 for s, p in zip(img.shape[1:], ps)]
+        img_p   = img[
+            :,
+            starts[0]:starts[0]+ps[0],
+            starts[1]:starts[1]+ps[1],
+            starts[2]:starts[2]+ps[2],
+        ]
+        seg_p   = seg[
+            starts[0]:starts[0]+ps[0],
+            starts[1]:starts[1]+ps[1],
+            starts[2]:starts[2]+ps[2],
+        ]
+
+        img_p, seg_p = self.aug(img_p.copy(), seg_p.copy(), training=self.augment)
+
+        return {
+            "image": torch.from_numpy(img_p.astype(np.float32)),
+            "label": torch.from_numpy(seg_p.astype(np.int64)),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  3D U-Net Architecture
+# ─────────────────────────────────────────────────────────────────────────────
+class ConvBlock3D(nn.Module):
+    """
+    Double conv block: (Conv3d → BN → ReLU) × 2
+    Residual connection added when in/out channels match.
+    """
+
+    def __init__(
+        self,
+        in_ch:   int,
+        out_ch:  int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv3d(in_ch,  out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout3d(p=dropout),
+            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+        # 1×1×1 projection for residual when channel dims differ
+        self.residual = (
+            nn.Conv3d(in_ch, out_ch, kernel_size=1, bias=False)
+            if in_ch != out_ch else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x) + self.residual(x)
+
+
+class EncoderBlock(nn.Module):
+    """ConvBlock followed by 2×2×2 max-pool for spatial downsampling."""
+
+    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.block = ConvBlock3D(in_ch, out_ch, dropout)
+        self.pool  = nn.MaxPool3d(2)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        skip = self.block(x)
+        return self.pool(skip), skip
+
+
+class DecoderBlock(nn.Module):
+    """
+    Trilinear upsample → concatenate skip connection → ConvBlock.
+    Skip connections (from U-Net encoder) preserve fine-grained spatial
+    detail lost during downsampling — critical for accurate tumour boundaries.
+    """
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int,
+                 dropout: float = 0.0) -> None:
+        super().__init__()
+        self.up   = nn.Upsample(scale_factor=2, mode="trilinear",
+                                align_corners=True)
+        self.block = ConvBlock3D(in_ch + skip_ch, out_ch, dropout)
+
+    def forward(
+        self, x: torch.Tensor, skip: torch.Tensor
+    ) -> torch.Tensor:
+        x = self.up(x)
+        # Pad x to match skip if spatial dims differ by 1 voxel
+        diff = [skip.shape[i] - x.shape[i] for i in range(2, 5)]
+        x    = F.pad(x, [0, diff[2], 0, diff[1], 0, diff[0]])
+        return self.block(torch.cat([x, skip], dim=1))
+
+
+class UNet3D(nn.Module):
+    """
+    3-D U-Net for volumetric brain tumour segmentation.
+
+    Justification of architectural choices
+    ---------------------------------------
+    Encoder–decoder + skip connections (U-Net)
+        The U-Net design addresses the varying tumour size challenge:
+        deep encoder stages capture large-scale context needed to locate
+        the tumour globally, while skip connections re-inject fine spatial
+        detail needed to delineate exact boundaries at the voxel level.
+
+    3D convolutions
+        Brain tumours are inherently 3-D structures with inter-slice
+        continuity.  3D convolutions capture this volumetric context
+        that 2D slice-wise approaches miss.
+
+    Batch Normalisation
+        Stabilises training of deep 3D networks where gradient flow
+        is challenging; reduces sensitivity to weight initialisation.
+
+    Residual connections within ConvBlocks
+        Mitigates vanishing gradients in deeper encoder stages; allows
+        gradients to bypass saturated layers during backpropagation.
+
+    Dropout3D (channel-wise)
+        Regularises the network given the limited annotated training data;
+        channel-wise dropout is more effective than element-wise for conv.
+
+    Trilinear upsampling (vs transposed conv)
+        Avoids checkerboard artefacts common with transposed convolutions,
+        producing smoother segmentation boundaries.
+    """
+
+    def __init__(self, cfg: Config = Config) -> None:
+        super().__init__()
+        f  = cfg.BASE_FILTERS       # base number of feature maps (16)
+        d  = cfg.DROPOUT
+        ic = cfg.IN_CHANNELS
+        nc = cfg.NUM_CLASSES
+
+        # ── Encoder ───────────────────────────────────────────────────────────
+        self.enc1 = EncoderBlock(ic,    f,     dropout=d)
+        self.enc2 = EncoderBlock(f,     f*2,   dropout=d)
+        self.enc3 = EncoderBlock(f*2,   f*4,   dropout=d)
+        self.enc4 = EncoderBlock(f*4,   f*8,   dropout=d)
+
+        # ── Bottleneck ────────────────────────────────────────────────────────
+        self.bottleneck = ConvBlock3D(f*8, f*16, dropout=d)
+
+        # ── Decoder ───────────────────────────────────────────────────────────
+        self.dec4 = DecoderBlock(f*16, f*8,  f*8,  dropout=d)
+        self.dec3 = DecoderBlock(f*8,  f*4,  f*4,  dropout=d)
+        self.dec2 = DecoderBlock(f*4,  f*2,  f*2,  dropout=d)
+        self.dec1 = DecoderBlock(f*2,  f,    f,    dropout=d)
+
+        # ── Output ────────────────────────────────────────────────────────────
+        self.out_conv = nn.Conv3d(f, nc, kernel_size=1)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, s1 = self.enc1(x)
+        x, s2 = self.enc2(x)
+        x, s3 = self.enc3(x)
+        x, s4 = self.enc4(x)
+        x     = self.bottleneck(x)
+        x     = self.dec4(x, s4)
+        x     = self.dec3(x, s3)
+        x     = self.dec2(x, s2)
+        x     = self.dec1(x, s1)
+        return self.out_conv(x)          # (B, NUM_CLASSES, D, H, W) logits
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4b.  Transfer learning: inflate 2-D pretrained weights → 3-D
+# ─────────────────────────────────────────────────────────────────────────────
+def inflate_2d_weights_to_3d(
+    state_dict_2d: dict,
+    model_3d:      nn.Module,
+) -> int:
+    """
+    'Weight inflation' strategy (Carreira & Zisserman, 2017):
+    A 2-D convolutional kernel of shape (C_out, C_in, H, W) is replicated
+    along a new depth dimension and divided by the depth to preserve the
+    activation magnitude:
+        W_3d[:, :, d, :, :] = W_2d / depth
+    This allows a pretrained 2-D encoder to initialise a 3-D U-Net,
+    providing better feature representations than random initialisation
+    when annotated 3-D data is scarce.
+
+    Returns the number of layers successfully inflated.
+    """
+    model_dict     = model_3d.state_dict()
+    inflated_count = 0
+
+    for k2d, v2d in state_dict_2d.items():
+        if k2d not in model_dict:
+            continue
+        v3d_shape = model_dict[k2d].shape
+
+        # Only inflate 4-D → 5-D conv kernels
+        if v2d.ndim == 4 and v3d_shape[2:] == (v2d.shape[2], v2d.shape[3], v2d.shape[3]):
+            depth     = v3d_shape[2]
+            inflated  = v2d.unsqueeze(2).repeat(1, 1, depth, 1, 1) / depth
+            if inflated.shape == v3d_shape:
+                model_dict[k2d] = inflated
+                inflated_count += 1
+        elif v2d.shape == v3d_shape:
+            model_dict[k2d] = v2d
+            inflated_count += 1
+
+    model_3d.load_state_dict(model_dict, strict=False)
+    print(f"  Transfer learning: inflated/copied {inflated_count} weight tensors.")
+    return inflated_count
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  Loss Functions
+# ─────────────────────────────────────────────────────────────────────────────
+class DiceLoss(nn.Module):
+    """
+    Soft multi-class Dice loss.
+    Dice = 2 * |P ∩ G| / (|P| + |G|)
+
+    Directly optimises the overlap metric used for evaluation.
+    Naturally handles class imbalance because it is normalised by the
+    total number of predicted + actual positive voxels, so rare classes
+    contribute equally to the loss regardless of their volume fraction.
+
+    Smooth factor ε prevents division by zero on empty label patches.
+    """
+
+    def __init__(self, smooth: float = 1e-5, ignore_bg: bool = True) -> None:
+        super().__init__()
+        self.smooth    = smooth
+        self.ignore_bg = ignore_bg
+
+    def forward(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
+        n_cls    = logits.shape[1]
+        probs    = F.softmax(logits, dim=1)               # (B,C,D,H,W)
+        targets1h = F.one_hot(targets, n_cls)             # (B,D,H,W,C)
+        targets1h = targets1h.permute(0, 4, 1, 2, 3).float()
+
+        start_cls = 1 if self.ignore_bg else 0
+        dice_vals = []
+        for c in range(start_cls, n_cls):
+            p   = probs[:, c].contiguous().view(-1)
+            g   = targets1h[:, c].contiguous().view(-1)
+            num = 2 * (p * g).sum() + self.smooth
+            den = p.sum() + g.sum() + self.smooth
+            dice_vals.append(1.0 - num / den)
+
+        return torch.stack(dice_vals).mean()
+
+
+class FocalLoss(nn.Module):
+    """
+    Multi-class Focal loss (Lin et al., 2017).
+    FL(p) = -α (1 - p_t)^γ  log(p_t)
+
+    Down-weights the loss contribution of easy (well-classified background)
+    voxels and focuses training on hard (tumour) voxels — directly addressing
+    the severe class imbalance in brain MRI segmentation.
+    """
+
+    def __init__(self, gamma: float = 2.0, alpha: Optional[torch.Tensor] = None) -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
+        ce   = F.cross_entropy(logits, targets, weight=self.alpha, reduction="none")
+        probs = F.softmax(logits, dim=1)
+        pt   = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        fl   = ((1 - pt) ** self.gamma) * ce
+        return fl.mean()
+
+
+class CombinedLoss(nn.Module):
+    """
+    Weighted combination: dice_w * DiceLoss  +  bce_w * CrossEntropyLoss.
+
+    The Dice component handles class imbalance; the cross-entropy component
+    provides per-voxel gradient signal that stabilises early training when
+    Dice loss gradients can be numerically unstable.
+    """
+
+    def __init__(self, cfg: Config = Config) -> None:
+        super().__init__()
+        self.dice_loss = DiceLoss(ignore_bg=True)
+        self.ce_loss   = nn.CrossEntropyLoss()
+        self.dw        = cfg.DICE_WEIGHT
+        self.bw        = cfg.BCE_WEIGHT
+
+    def forward(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dl   = self.dice_loss(logits, targets)
+        ce   = self.ce_loss(logits, targets)
+        loss = self.dw * dl + self.bw * ce
+        return loss, dl, ce
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Evaluation Metrics
+# ─────────────────────────────────────────────────────────────────────────────
+def dice_score(
+    pred: np.ndarray,
+    gt:   np.ndarray,
+    cls:  int,
+    smooth: float = 1e-5,
+) -> float:
+    """Per-class Dice score: 2|P∩G| / (|P|+|G|)."""
+    p   = (pred == cls).astype(float)
+    g   = (gt   == cls).astype(float)
+    num = 2 * (p * g).sum() + smooth
+    den = p.sum() + g.sum() + smooth
+    return float(num / den)
+
+
+def iou_score(
+    pred: np.ndarray,
+    gt:   np.ndarray,
+    cls:  int,
+    smooth: float = 1e-5,
+) -> float:
+    """Per-class Intersection over Union (Jaccard index)."""
+    p   = (pred == cls).astype(float)
+    g   = (gt   == cls).astype(float)
+    i   = (p * g).sum()
+    u   = p.sum() + g.sum() - i
+    return float((i + smooth) / (u + smooth))
+
+
+def hausdorff_distance(
+    pred: np.ndarray,
+    gt:   np.ndarray,
+    cls:  int,
+) -> float:
+    """
+    Symmetric Hausdorff distance between predicted and ground-truth
+    tumour surface for a given class.
+    Returns NaN if either mask is empty (avoids invalid distance).
+    """
+    if not SCIPY_AVAILABLE:
+        return float("nan")
+
+    p_pts = np.argwhere(pred == cls).astype(float)
+    g_pts = np.argwhere(gt   == cls).astype(float)
+
+    if len(p_pts) == 0 or len(g_pts) == 0:
+        return float("nan")
+
+    d1 = directed_hausdorff(p_pts, g_pts)[0]
+    d2 = directed_hausdorff(g_pts, p_pts)[0]
+    return max(d1, d2)
+
+
+def evaluate_batch(
+    logits:  torch.Tensor,
+    targets: torch.Tensor,
+    n_cls:   int,
+) -> Dict[str, List[float]]:
+    """Compute Dice + IoU for every class in a batch."""
+    preds = logits.argmax(dim=1).cpu().numpy()
+    gts   = targets.cpu().numpy()
+    metrics: Dict[str, List[float]] = {"dice": [], "iou": []}
+    for cls in range(1, n_cls):        # skip background
+        batch_dice = [dice_score(preds[b], gts[b], cls)
+                      for b in range(preds.shape[0])]
+        batch_iou  = [iou_score(preds[b], gts[b], cls)
+                      for b in range(preds.shape[0])]
+        metrics["dice"].append(float(np.mean(batch_dice)))
+        metrics["iou"].append(float(np.mean(batch_iou)))
+    return metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  Training Loop
+# ─────────────────────────────────────────────────────────────────────────────
+def train_one_epoch(
+    model:      nn.Module,
+    loader:     DataLoader,
+    criterion:  CombinedLoss,
+    optimizer:  torch.optim.Optimizer,
+    scaler:     GradScaler,
+    device:     str,
+    cfg:        Config,
+) -> Dict[str, float]:
+    model.train()
+    total_loss = dice_loss_sum = ce_loss_sum = 0.0
+    dice_sums  = [0.0] * (cfg.NUM_CLASSES - 1)
+    n_batches  = 0
+
+    for batch in loader:
+        imgs   = batch["image"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # Automatic Mixed Precision forward pass
+        with autocast(enabled=cfg.AMP and device == "cuda"):
+            logits           = model(imgs)
+            loss, dl, ce     = criterion(logits, labels)
+
+        # Scaled backward + gradient clipping
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss    += loss.item()
+        dice_loss_sum += dl.item()
+        ce_loss_sum   += ce.item()
+
+        m = evaluate_batch(logits.detach(), labels, cfg.NUM_CLASSES)
+        for i, d in enumerate(m["dice"]):
+            dice_sums[i] += d
+        n_batches += 1
+
+    n = max(n_batches, 1)
+    return {
+        "loss":      total_loss    / n,
+        "dice_loss": dice_loss_sum / n,
+        "ce_loss":   ce_loss_sum   / n,
+        "dice_cls":  [s / n for s in dice_sums],
+        "mean_dice": float(np.mean([s / n for s in dice_sums])),
+    }
+
+
+@torch.no_grad()
+def validate(
+    model:     nn.Module,
+    loader:    DataLoader,
+    criterion: CombinedLoss,
+    device:    str,
+    cfg:       Config,
+) -> Dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    dice_sums  = [0.0] * (cfg.NUM_CLASSES - 1)
+    iou_sums   = [0.0] * (cfg.NUM_CLASSES - 1)
+    n_batches  = 0
+
+    for batch in loader:
+        imgs   = batch["image"].to(device)
+        labels = batch["label"].to(device)
+
+        with autocast(enabled=cfg.AMP and device == "cuda"):
+            logits       = model(imgs)
+            loss, _, _   = criterion(logits, labels)
+
+        total_loss += loss.item()
+        m = evaluate_batch(logits, labels, cfg.NUM_CLASSES)
+        for i in range(len(dice_sums)):
+            dice_sums[i] += m["dice"][i]
+            iou_sums[i]  += m["iou"][i]
+        n_batches += 1
+
+    n = max(n_batches, 1)
+    return {
+        "loss":      total_loss / n,
+        "dice_cls":  [s / n for s in dice_sums],
+        "iou_cls":   [s / n for s in iou_sums],
+        "mean_dice": float(np.mean([s / n for s in dice_sums])),
+        "mean_iou":  float(np.mean([s / n for s in iou_sums])),
+    }
+
+
+def train(
+    model:      nn.Module,
+    train_loader: DataLoader,
+    val_loader:   DataLoader,
+    cfg:          Config,
+) -> Dict[str, list]:
+    """Full training loop with AMP, early stopping, and checkpointing."""
+
+    device    = cfg.DEVICE
+    criterion = CombinedLoss(cfg).to(device)
+    optimizer = AdamW(model.parameters(), lr=cfg.LR,
+                      weight_decay=cfg.WEIGHT_DECAY)
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=1e-6)
+    scaler    = GradScaler(enabled=cfg.AMP and device == "cuda")
+
+    history: Dict[str, list] = {
+        "train_loss": [], "val_loss": [],
+        "train_dice": [], "val_dice": [],
+        "val_iou":    [], "lr":       [],
+    }
+
+    best_val_dice = -1.0
+    patience_ctr  = 0
+    best_ckpt     = str(cfg.CHECKPOINT_DIR / "best_model.pth")
+
+    print(f"\n{'='*65}")
+    print(f"Training on {device.upper()}"
+          + (f"  [{torch.cuda.get_device_name(0)}]"
+             if device == "cuda" else ""))
+    print(f"Epochs: {cfg.EPOCHS}  |  Batch: {cfg.BATCH_SIZE}"
+          f"  |  Patch: {cfg.PATCH_SIZE}  |  LR: {cfg.LR}")
+    print(f"{'='*65}\n")
+
+    for epoch in range(1, cfg.EPOCHS + 1):
+        t0 = time.time()
+
+        train_m = train_one_epoch(model, train_loader, criterion,
+                                   optimizer, scaler, device, cfg)
+        val_m   = validate(model, val_loader, criterion, device, cfg)
+        scheduler.step()
+
+        lr = optimizer.param_groups[0]["lr"]
+        history["train_loss"].append(train_m["loss"])
+        history["val_loss"].append(val_m["loss"])
+        history["train_dice"].append(train_m["mean_dice"])
+        history["val_dice"].append(val_m["mean_dice"])
+        history["val_iou"].append(val_m["mean_iou"])
+        history["lr"].append(lr)
+
+        elapsed = time.time() - t0
+        print(
+            f"Epoch [{epoch:3d}/{cfg.EPOCHS}]  "
+            f"Train loss: {train_m['loss']:.4f}  "
+            f"Train Dice: {train_m['mean_dice']:.4f}  |  "
+            f"Val loss: {val_m['loss']:.4f}  "
+            f"Val Dice: {val_m['mean_dice']:.4f}  "
+            f"Val IoU: {val_m['mean_iou']:.4f}  "
+            f"({elapsed:.0f}s)"
+        )
+
+        # Per-class Dice
+        cls_str = "  ".join(
+            f"{Config.CLASS_NAMES[c+1]}:{val_m['dice_cls'][c]:.3f}"
+            for c in range(len(val_m["dice_cls"]))
+        )
+        print(f"           Per-class val Dice: {cls_str}")
+
+        # Checkpoint: save best model
+        if val_m["mean_dice"] > best_val_dice:
+            best_val_dice = val_m["mean_dice"]
+            patience_ctr  = 0
+            save_checkpoint(model, optimizer, epoch, val_m, best_ckpt)
+            print(f"           ✓ New best model saved  (Dice={best_val_dice:.4f})")
+        else:
+            patience_ctr += 1
+            if patience_ctr >= cfg.PATIENCE:
+                print(f"\nEarly stopping triggered at epoch {epoch}"
+                      f" (no improvement for {cfg.PATIENCE} epochs)")
+                break
+
+    # Save final weights
+    final_ckpt = str(cfg.CHECKPOINT_DIR / "final_model.pth")
+    save_checkpoint(model, optimizer, epoch, val_m, final_ckpt)
+    print(f"\nFinal model saved → {final_ckpt}")
+    print(f"Best model saved  → {best_ckpt}"
+          f"  (Val Dice = {best_val_dice:.4f})")
+
+    return history
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  Checkpoint helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def save_checkpoint(
+    model:     nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch:     int,
+    metrics:   dict,
+    path:      str,
+) -> None:
+    torch.save({
+        "epoch":       epoch,
+        "model_state": model.state_dict(),
+        "optim_state": optimizer.state_dict(),
+        "metrics":     metrics,
+        "config": {
+            "IN_CHANNELS":  Config.IN_CHANNELS,
+            "NUM_CLASSES":  Config.NUM_CLASSES,
+            "BASE_FILTERS": Config.BASE_FILTERS,
+            "PATCH_SIZE":   Config.PATCH_SIZE,
+        },
+    }, path)
+
+
+def load_checkpoint(path: str, model: nn.Module,
+                    device: str = "cpu") -> dict:
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+    print(f"Loaded checkpoint from epoch {ckpt['epoch']}"
+          f"  (Val Dice = {ckpt['metrics'].get('mean_dice', 'N/A'):.4f})")
+    return ckpt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  Hyperparameter search
+# ─────────────────────────────────────────────────────────────────────────────
+def hyperparameter_search(
+    train_ds: Dataset,
+    val_ds:   Dataset,
+    cfg:      Config,
+) -> dict:
+    """
+    Lightweight grid search over LR, base filters, and loss weights.
+    Each config is trained for a small number of warm-up epochs and
+    evaluated by validation Dice.  The best config is returned.
+    """
+    grid = {
+        "lr":           [1e-3, 5e-4],
+        "base_filters": [16, 32],
+        "dice_weight":  [0.6, 0.8],
+    }
+
+    results  = []
+    best_cfg = None
+    best_val = -1.0
+
+    print(f"\n{'='*65}")
+    print("Hyperparameter search")
+    print(f"{'='*65}")
+
+    combo_id = 0
+    for lr in grid["lr"]:
+        for bf in grid["base_filters"]:
+            for dw in grid["dice_weight"]:
+                combo_id += 1
+                print(f"\n  Config {combo_id}: lr={lr}  base_filters={bf}"
+                      f"  dice_weight={dw}")
+
+                # Temporarily override config
+                cfg.LR           = lr
+                cfg.BASE_FILTERS = bf
+                cfg.DICE_WEIGHT  = dw
+                cfg.BCE_WEIGHT   = 1.0 - dw
+                cfg.EPOCHS       = 5        # short warm-up
+
+                set_seed(cfg.SEED)
+                model = UNet3D(cfg).to(cfg.DEVICE)
+                tl    = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE,
+                                   shuffle=True,  num_workers=cfg.NUM_WORKERS)
+                vl    = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE,
+                                   shuffle=False, num_workers=cfg.NUM_WORKERS)
+
+                criterion = CombinedLoss(cfg).to(cfg.DEVICE)
+                optimizer = AdamW(model.parameters(), lr=cfg.LR,
+                                  weight_decay=cfg.WEIGHT_DECAY)
+                scaler    = GradScaler(enabled=cfg.AMP and cfg.DEVICE == "cuda")
+
+                for _ in range(cfg.EPOCHS):
+                    train_one_epoch(model, tl, criterion, optimizer,
+                                    scaler, cfg.DEVICE, cfg)
+                val_m = validate(model, vl, criterion, cfg.DEVICE, cfg)
+
+                print(f"    → Val Dice: {val_m['mean_dice']:.4f}"
+                      f"  Val IoU: {val_m['mean_iou']:.4f}")
+
+                results.append({
+                    "lr": lr, "base_filters": bf, "dice_weight": dw,
+                    "val_dice": round(val_m["mean_dice"], 4),
+                    "val_iou":  round(val_m["mean_iou"],  4),
+                })
+
+                if val_m["mean_dice"] > best_val:
+                    best_val = val_m["mean_dice"]
+                    best_cfg = {"lr": lr, "base_filters": bf,
+                                "dice_weight": dw}
+
+    # Save search results
+    df   = pd.DataFrame(results).sort_values("val_dice", ascending=False)
+    path = str(cfg.RESULTS_DIR / "hyperparameter_search.csv")
+    df.to_csv(path, index=False)
+    print(f"\nHyperparameter search results saved → {path}")
+    print(f"Best config: {best_cfg}  (Val Dice = {best_val:.4f})")
+
+    return best_cfg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10.  Full test-set evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def test_evaluation(
+    model:      nn.Module,
+    test_loader: DataLoader,
+    cfg:         Config,
+) -> Dict[str, float]:
+    """Compute Dice, IoU, and Hausdorff distance on the test set."""
+    device = cfg.DEVICE
+    model.eval()
+
+    all_dice = {c: [] for c in range(1, cfg.NUM_CLASSES)}
+    all_iou  = {c: [] for c in range(1, cfg.NUM_CLASSES)}
+    all_hd   = {c: [] for c in range(1, cfg.NUM_CLASSES)}
+
+    for batch in test_loader:
+        imgs   = batch["image"].to(device)
+        labels = batch["label"]
+
+        with autocast(enabled=cfg.AMP and device == "cuda"):
+            logits = model(imgs)
+
+        preds = logits.argmax(dim=1).cpu().numpy()
+        gts   = labels.numpy()
+
+        for b in range(preds.shape[0]):
+            for c in range(1, cfg.NUM_CLASSES):
+                all_dice[c].append(dice_score(preds[b], gts[b], c))
+                all_iou[c].append(iou_score(preds[b],   gts[b], c))
+                all_hd[c].append(hausdorff_distance(preds[b], gts[b], c))
+
+    summary = {}
+    print(f"\n{'='*65}")
+    print("Test Set Evaluation")
+    print(f"{'='*65}")
+    print(f"{'Class':<20}  {'Dice':>8}  {'IoU':>8}  {'Hausdorff':>10}")
+    print("-" * 50)
+    for c in range(1, cfg.NUM_CLASSES):
+        d  = float(np.nanmean(all_dice[c]))
+        i  = float(np.nanmean(all_iou[c]))
+        h  = float(np.nanmean([v for v in all_hd[c] if not math.isnan(v)] or [float("nan")]))
+        cname = cfg.CLASS_NAMES[c]
+        print(f"{cname:<20}  {d:>8.4f}  {i:>8.4f}  {h:>10.2f}")
+        summary[f"dice_{cname}"]      = d
+        summary[f"iou_{cname}"]       = i
+        summary[f"hausdorff_{cname}"] = h
+
+    mean_d = float(np.mean([summary[k] for k in summary if k.startswith("dice_")]))
+    mean_i = float(np.mean([summary[k] for k in summary if k.startswith("iou_")]))
+    print("-" * 50)
+    print(f"{'Mean (foreground)':<20}  {mean_d:>8.4f}  {mean_i:>8.4f}")
+    summary["mean_dice"] = mean_d
+    summary["mean_iou"]  = mean_i
+
+    # Save CSV
+    csv_path = str(cfg.RESULTS_DIR / "metrics_summary.csv")
+    pd.DataFrame([summary]).to_csv(csv_path, index=False)
+    print(f"\nMetrics saved → {csv_path}")
+
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11.  Visualisations
+# ─────────────────────────────────────────────────────────────────────────────
+SEG_CMAP = ListedColormap(["black", "red", "green", "blue"])
+
+
+def plot_training_curves(history: Dict[str, list], cfg: Config) -> None:
+    """Save training/validation loss and Dice curves."""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    axes[0].plot(history["train_loss"], label="Train", color="#2c3e50", lw=2)
+    axes[0].plot(history["val_loss"],   label="Val",   color="#e74c3c", lw=2)
+    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Combined Loss")
+    axes[0].set_title("Loss Curves", fontweight="bold")
+    axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(history["train_dice"], label="Train Dice", color="#2c3e50", lw=2)
+    axes[1].plot(history["val_dice"],   label="Val Dice",   color="#e74c3c", lw=2)
+    axes[1].plot(history["val_iou"],    label="Val IoU",    color="#3498db", lw=2,
+                 linestyle="--")
+    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Score")
+    axes[1].set_title("Dice & IoU Curves", fontweight="bold")
+    axes[1].legend(); axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(history["lr"], color="#8e44ad", lw=2)
+    axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("Learning Rate")
+    axes[2].set_title("Learning Rate Schedule (Cosine)", fontweight="bold")
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = str(cfg.RESULTS_DIR / "training_curves.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Training curves saved → {path}")
+
+
+def plot_dice_per_class(metrics: Dict[str, float], cfg: Config) -> None:
+    """Bar chart of Dice score per tumour sub-region."""
+    classes = cfg.CLASS_NAMES[1:]    # skip background
+    scores  = [metrics.get(f"dice_{c}", 0.0) for c in classes]
+    colours = ["#e74c3c", "#2ecc71", "#3498db"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(classes, scores, color=colours, edgecolor="black", width=0.5)
+    for bar, val in zip(bars, scores):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.01,
+                f"{val:.3f}", ha="center", fontweight="bold", fontsize=11)
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel("Dice Score")
+    ax.set_title("Test Dice Score per Tumour Sub-Region", fontweight="bold")
+    ax.axhline(metrics.get("mean_dice", 0), color="gray",
+               linestyle="--", lw=1.5, label="Mean Dice")
+    ax.legend()
+    plt.tight_layout()
+    path = str(cfg.RESULTS_DIR / "dice_per_class.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Dice-per-class chart saved → {path}")
+
+
+@torch.no_grad()
+def save_sample_predictions(
+    model:   nn.Module,
+    dataset: Dataset,
+    cfg:     Config,
+    n:       int = 5,
+) -> None:
+    """
+    For the first N samples, save a 3-panel figure showing:
+      Col 1 — input FLAIR slice (axial mid-plane)
+      Col 2 — ground-truth segmentation
+      Col 3 — model prediction
+    """
+    device = cfg.DEVICE
+    model.eval()
+
+    for idx in range(min(n, len(dataset))):
+        sample = dataset[idx]
+        img    = sample["image"].unsqueeze(0).to(device)
+        lbl    = sample["label"].numpy()
+
+        with autocast(enabled=cfg.AMP and device == "cuda"):
+            logit = model(img)
+        pred = logit.argmax(dim=1).squeeze(0).cpu().numpy()
+
+        # Pick the axial slice with the most foreground
+        fg_per_slice = (lbl > 0).sum(axis=(1, 2))
+        mid_z        = int(fg_per_slice.argmax()) if fg_per_slice.max() > 0 \
+                       else lbl.shape[0] // 2
+
+        flair_slice = sample["image"][0, mid_z].numpy()
+        lbl_slice   = lbl[mid_z]
+        pred_slice  = pred[mid_z]
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig.suptitle(f"Sample {idx + 1}  —  Axial slice z={mid_z}",
+                     fontsize=13, fontweight="bold")
+
+        axes[0].imshow(flair_slice, cmap="gray", origin="lower")
+        axes[0].set_title("FLAIR Input", fontweight="bold")
+        axes[0].axis("off")
+
+        axes[1].imshow(flair_slice, cmap="gray", origin="lower")
+        axes[1].imshow(lbl_slice,  cmap=SEG_CMAP, alpha=0.6,
+                       vmin=0, vmax=3, origin="lower")
+        axes[1].set_title("Ground Truth", fontweight="bold")
+        axes[1].axis("off")
+
+        axes[2].imshow(flair_slice, cmap="gray", origin="lower")
+        axes[2].imshow(pred_slice, cmap=SEG_CMAP, alpha=0.6,
+                       vmin=0, vmax=3, origin="lower")
+        axes[2].set_title("Prediction", fontweight="bold")
+        axes[2].axis("off")
+
+        # Colour legend
+        legend_patches = [
+            plt.Rectangle((0, 0), 1, 1, color="red",   label="Necrotic Core"),
+            plt.Rectangle((0, 0), 1, 1, color="green", label="Oedema"),
+            plt.Rectangle((0, 0), 1, 1, color="blue",  label="Enhancing"),
+        ]
+        axes[2].legend(handles=legend_patches, loc="lower right",
+                       fontsize=8, framealpha=0.7)
+
+        plt.tight_layout()
+        path = str(cfg.PRED_DIR / f"sample_{idx+1:02d}.png")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+
+    print(f"Sample predictions saved → {cfg.PRED_DIR}/")
+
+
+def plot_model_architecture_summary(model: nn.Module, cfg: Config) -> None:
+    """Save a text summary of the model parameter counts per module."""
+    lines   = ["3D U-Net Architecture Summary", "=" * 55]
+    total   = 0
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv3d, nn.BatchNorm3d, nn.Linear)):
+            params = sum(p.numel() for p in module.parameters())
+            total += params
+            lines.append(f"  {name:<45} {params:>10,}")
+    lines.append("=" * 55)
+    lines.append(f"  {'TOTAL PARAMETERS':<45} {total:>10,}")
+
+    path = str(cfg.RESULTS_DIR / "model_summary.txt")
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"Model summary saved → {path}")
+    print(f"  Total parameters: {total:,}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12.  Dataset factory  (real BraTS  or  synthetic)
+# ─────────────────────────────────────────────────────────────────────────────
+def build_datasets(
+    cfg: Config, synthetic: bool = False
+) -> Tuple[Dataset, Dataset, Dataset]:
+    """
+    Returns (train_dataset, val_dataset, test_dataset).
+    If  synthetic=True  or BraTS data is unavailable, uses SyntheticDataset.
+    """
+    use_synthetic = synthetic or not NIBABEL_AVAILABLE
+    patient_dirs  = []   # always initialised — avoids UnboundLocalError
+
+    if not use_synthetic:
+        if not cfg.DATA_ROOT.exists():
+            print(f"  Data root not found: {cfg.DATA_ROOT}")
+            print("  Switching to synthetic data.")
+            use_synthetic = True
+        else:
+            patient_dirs = sorted([
+                d for d in cfg.DATA_ROOT.iterdir()
+                if d.is_dir() and "BraTS" in d.name
+            ])
+            if len(patient_dirs) == 0:
+                print("  No patient directories found — switching to synthetic data.")
+                use_synthetic = True
+
+    if use_synthetic:
+        print("  Using SYNTHETIC data (no BraTS dataset required)")
+        n_train, n_val, n_test = 40, 10, 10
+        train_ds = SyntheticDataset(n_train, cfg, augment=True)
+        val_ds   = SyntheticDataset(n_val,   cfg, augment=False)
+        test_ds  = SyntheticDataset(n_test,  cfg, augment=False)
+        return train_ds, val_ds, test_ds
+
+    # Real BraTS split
+    n     = len(patient_dirs)
+    n_test = max(1, int(n * cfg.TEST_SPLIT))
+    n_val  = max(1, int(n * cfg.VAL_SPLIT))
+    n_tr   = n - n_val - n_test
+
+    random.shuffle(patient_dirs)
+    tr_dirs   = patient_dirs[:n_tr]
+    val_dirs  = patient_dirs[n_tr:n_tr + n_val]
+    test_dirs = patient_dirs[n_tr + n_val:]
+
+    print(f"  BraTS patients — Train: {len(tr_dirs)}"
+          f"  Val: {len(val_dirs)}  Test: {len(test_dirs)}")
+
+    train_ds = BraTSDataset(tr_dirs,   cfg, augment=True)
+    val_ds   = BraTSDataset(val_dirs,  cfg, augment=False)
+    test_ds  = BraTSDataset(test_dirs, cfg, augment=False)
+    return train_ds, val_ds, test_ds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13.  Main entry point
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="CN6021 Task 2 — 3D Brain Tumour Segmentation"
+    )
+    p.add_argument("--synthetic", action="store_true",
+                   help="Use synthetic data (no BraTS required)")
+    p.add_argument("--eval", action="store_true",
+                   help="Evaluate only (requires --checkpoint)")
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="Path to checkpoint for evaluation")
+    p.add_argument("--no_hp_search", action="store_true",
+                   help="Skip hyperparameter search, use default config")
+    p.add_argument("--epochs", type=int, default=None,
+                   help="Override number of training epochs")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    cfg  = Config()
+
+    if args.epochs:
+        cfg.EPOCHS = args.epochs
+
+    set_seed(cfg.SEED)
+    make_dirs()
+
+    print("=" * 65)
+    print("CN6021 Task 2 — 3D Brain Tumour Segmentation")
+    print(f"Device : {cfg.DEVICE.upper()}")
+    print(f"PyTorch: {torch.__version__}")
+    print("=" * 65)
+
+    # ── Build datasets ────────────────────────────────────────────────────────
+    print("\nSTEP 1 — Building datasets")
+    train_ds, val_ds, test_ds = build_datasets(
+        cfg, synthetic=args.synthetic
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.BATCH_SIZE,
+        shuffle=True,  num_workers=cfg.NUM_WORKERS, pin_memory=True,
+    )
+    val_loader   = DataLoader(
+        val_ds,   batch_size=cfg.BATCH_SIZE,
+        shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=True,
+    )
+    test_loader  = DataLoader(
+        test_ds,  batch_size=cfg.BATCH_SIZE,
+        shuffle=False, num_workers=cfg.NUM_WORKERS,
+    )
+
+    # ── Evaluation-only mode ──────────────────────────────────────────────────
+    if args.eval:
+        if not args.checkpoint:
+            print("ERROR: --eval requires --checkpoint <path>")
+            sys.exit(1)
+        print(f"\nEvaluation mode — loading {args.checkpoint}")
+        model = UNet3D(cfg).to(cfg.DEVICE)
+        load_checkpoint(args.checkpoint, model, cfg.DEVICE)
+        metrics = test_evaluation(model, test_loader, cfg)
+        plot_dice_per_class(metrics, cfg)
+        save_sample_predictions(model, test_ds, cfg, n=cfg.SAVE_VIS_N)
+        return
+
+    # ── Hyperparameter search ─────────────────────────────────────────────────
+    if not args.no_hp_search:
+        print("\nSTEP 2 — Hyperparameter search")
+        best_hp = hyperparameter_search(train_ds, val_ds, cfg)
+        cfg.LR           = best_hp["lr"]
+        cfg.BASE_FILTERS = best_hp["base_filters"]
+        cfg.DICE_WEIGHT  = best_hp["dice_weight"]
+        cfg.BCE_WEIGHT   = 1.0 - cfg.DICE_WEIGHT
+        # Restore full epoch count after search
+        cfg.EPOCHS = Config.EPOCHS
+    else:
+        print("\nSTEP 2 — Skipping hyperparameter search (using defaults)")
+
+    # ── Build final model ─────────────────────────────────────────────────────
+    print("\nSTEP 3 — Building 3D U-Net")
+    set_seed(cfg.SEED)
+    model = UNet3D(cfg).to(cfg.DEVICE)
+    plot_model_architecture_summary(model, cfg)
+
+    # ── Train ─────────────────────────────────────────────────────────────────
+    print("\nSTEP 4 — Training")
+    history = train(model, train_loader, val_loader, cfg)
+    plot_training_curves(history, cfg)
+
+    # ── Load best checkpoint for evaluation ───────────────────────────────────
+    print("\nSTEP 5 — Loading best checkpoint for test evaluation")
+    best_ckpt = str(cfg.CHECKPOINT_DIR / "best_model.pth")
+    if Path(best_ckpt).exists():
+        load_checkpoint(best_ckpt, model, cfg.DEVICE)
+
+    # ── Test evaluation ───────────────────────────────────────────────────────
+    print("\nSTEP 6 — Test evaluation")
+    metrics = test_evaluation(model, test_loader, cfg)
+
+    # ── Visualisations ────────────────────────────────────────────────────────
+    print("\nSTEP 7 — Saving visualisations")
+    plot_dice_per_class(metrics, cfg)
+    save_sample_predictions(model, test_ds, cfg, n=cfg.SAVE_VIS_N)
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    print(f"\n{'='*65}")
+    print("Pipeline complete.")
+    print(f"  Best checkpoint  → {cfg.CHECKPOINT_DIR}/best_model.pth")
+    print(f"  Final checkpoint → {cfg.CHECKPOINT_DIR}/final_model.pth")
+    print(f"  Training curves  → {cfg.RESULTS_DIR}/training_curves.png")
+    print(f"  Dice per class   → {cfg.RESULTS_DIR}/dice_per_class.png")
+    print(f"  Predictions      → {cfg.PRED_DIR}/")
+    print(f"  Metrics CSV      → {cfg.RESULTS_DIR}/metrics_summary.csv")
+    print(f"  HP search CSV    → {cfg.RESULTS_DIR}/hyperparameter_search.csv")
+    print(f"{'='*65}")
+
+
+if __name__ == "__main__":
+    main()

@@ -644,245 +644,246 @@ def main() -> None:
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
-plt.tight_layout()
-save_fig("06_training_curves.png")
+    plt.tight_layout()
+    save_fig("06_training_curves.png")
 
-model_path = os.path.join(OUTPUT_DIR, "churn_model.pkl")
-with open(model_path, "wb") as f:
-    pickle.dump(
-    {
-        "model": final_model,
-        "scaler": scaler,
-        "feature_names": feature_names,
-        "optimal_threshold": optimal_threshold,
-        "best_params": best_params,
-    },
-    f,
-)
-print(f" Saved model → {model_path}")
+    # ── 4.7 Evaluation ───────────────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print("STEP 7 — Evaluation on held-out test set")
+    print("=" * 65)
 
-# ── 4.7 Evaluation ───────────────────────────────────────────────────────
-print("\n" + "=" * 65)
-print("STEP 7 — Evaluation on held-out test set")
-print("=" * 65)
+    y_pred_proba = final_model.predict_proba(X_test)
+    y_pred = final_model.predict(X_test)
 
-y_pred_proba = final_model.predict_proba(X_test)
-y_pred = final_model.predict(X_test)
+    print("\nClassification Report (threshold = 0.5):")
+    print(classification_report(y_test, y_pred, target_names=["Retained", "Churned"]))
 
-print("\nClassification Report (threshold = 0.5):")
-print(classification_report(y_test, y_pred, target_names=["Retained", "Churned"]))
+    auc = roc_auc_score(y_test, y_pred_proba)
+    prec, rec, f1, _ = precision_recall_fscore_support(y_test, y_pred, average="macro")
+    print(f"AUC-ROC  : {auc:.4f}")
+    print(f"Macro    — Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}")
 
-auc = roc_auc_score(y_test, y_pred_proba)
-prec, rec, f1, _ = precision_recall_fscore_support(y_test, y_pred, average="macro")
-print(f"AUC-ROC  : {auc:.4f}")
-print(f"Macro    — Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}")
+    # Fig 7 — Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        ax=ax,
+        xticklabels=["Retained", "Churned"],
+        yticklabels=["Retained", "Churned"],
+        annot_kws={"size": 14},
+    )
+    ax.set_xlabel("Predicted", fontsize=12)
+    ax.set_ylabel("Actual", fontsize=12)
+    ax.set_title(
+        f"Confusion Matrix  (AUC-ROC: {auc:.4f})", fontsize=13, fontweight="bold"
+    )
+    plt.tight_layout()
+    save_fig("07_confusion_matrix.png")
 
-# Fig 7 — Confusion matrix
-cm = confusion_matrix(y_test, y_pred)
-fig, ax = plt.subplots(figsize=(7, 6))
-sns.heatmap(
-    cm,
-    annot=True,
-    fmt="d",
-    cmap="Blues",
-    ax=ax,
-    xticklabels=["Retained", "Churned"],
-    yticklabels=["Retained", "Churned"],
-    annot_kws={"size": 14},
-)
-ax.set_xlabel("Predicted", fontsize=12)
-ax.set_ylabel("Actual", fontsize=12)
-ax.set_title(
-    f"Confusion Matrix  (AUC-ROC: {auc:.4f})", fontsize=13, fontweight="bold"
-)
-plt.tight_layout()
-save_fig("07_confusion_matrix.png")
+    # Fig 8 — ROC curve
+    fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.plot(fpr, tpr, color="#2c3e50", lw=2, label=f"Shallow NN (AUC = {auc:.4f})")
+    ax.plot(
+        [0, 1], [0, 1], "--", color="gray", lw=1, label="Random Baseline (AUC = 0.5)"
+    )
+    ax.set_xlabel("False Positive Rate", fontsize=12)
+    ax.set_ylabel("True Positive Rate", fontsize=12)
+    ax.set_title("ROC Curve", fontsize=14, fontweight="bold")
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    save_fig("08_roc_curve.png")
 
-# Fig 8 — ROC curve
-fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-fig, ax = plt.subplots(figsize=(7, 6))
-ax.plot(fpr, tpr, color="#2c3e50", lw=2, label=f"Shallow NN (AUC = {auc:.4f})")
-ax.plot(
-    [0, 1], [0, 1], "--", color="gray", lw=1, label="Random Baseline (AUC = 0.5)"
-)
-ax.set_xlabel("False Positive Rate", fontsize=12)
-ax.set_ylabel("True Positive Rate", fontsize=12)
-ax.set_title("ROC Curve", fontsize=14, fontweight="bold")
-ax.legend(fontsize=11)
-ax.grid(True, alpha=0.3)
-plt.tight_layout()
-save_fig("08_roc_curve.png")
+    # ── 4.8  Threshold optimisation & PR curve ────────────────────────────────
+    print("\n" + "=" * 65)
+    print("STEP 8 — Threshold optimisation & Precision-Recall analysis")
+    print("=" * 65)
 
-# ── 4.8  Threshold optimisation & PR curve ────────────────────────────────
-print("\n" + "=" * 65)
-print("STEP 8 — Threshold optimisation & Precision-Recall analysis")
-print("=" * 65)
+    # Optimal threshold from val set (not test — avoids leakage)
+    val_proba = final_model.predict_proba(X_val)
+    prec_val, rec_val, thr = precision_recall_curve(y_val, val_proba)
+    f1_thr = 2 * prec_val[:-1] * rec_val[:-1] / (prec_val[:-1] + rec_val[:-1] + 1e-8)
+    optimal_idx = np.argmax(f1_thr)
+    optimal_threshold = thr[optimal_idx]
 
-# Optimal threshold from val set (not test — avoids leakage)
-val_proba = final_model.predict_proba(X_val)
-prec_val, rec_val, thr = precision_recall_curve(y_val, val_proba)
-f1_thr = 2 * prec_val[:-1] * rec_val[:-1] / (prec_val[:-1] + rec_val[:-1] + 1e-8)
-optimal_idx = np.argmax(f1_thr)
-optimal_threshold = thr[optimal_idx]
+    y_pred_opt = (y_pred_proba >= optimal_threshold).astype(int)
 
-y_pred_opt = (y_pred_proba >= optimal_threshold).astype(int)
+    # PR curve on test set
+    prec_test, rec_test, _ = precision_recall_curve(y_test, y_pred_proba)
+    ap = average_precision_score(y_test, y_pred_proba)
 
-# PR curve on test set
-prec_test, rec_test, _ = precision_recall_curve(y_test, y_pred_proba)
-ap = average_precision_score(y_test, y_pred_proba)
+    # Fig 9 — PR curve + F1-vs-threshold
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-# Fig 9 — PR curve + F1-vs-threshold
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].plot(
+        rec_test, prec_test, color="#2c3e50", lw=2, label=f"Shallow NN (AP = {ap:.4f})"
+    )
+    axes[0].axhline(
+        y_test.mean(),
+        color="gray",
+        linestyle="--",
+        lw=1,
+        label=f"Random Baseline (AP = {y_test.mean():.2f})",
+    )
+    axes[0].set_xlabel("Recall", fontsize=12)
+    axes[0].set_ylabel("Precision", fontsize=12)
+    axes[0].set_title("Precision-Recall Curve", fontsize=13, fontweight="bold")
+    axes[0].legend(fontsize=10)
+    axes[0].grid(True, alpha=0.3)
 
-axes[0].plot(
-    rec_test, prec_test, color="#2c3e50", lw=2, label=f"Shallow NN (AP = {ap:.4f})"
-)
-axes[0].axhline(
-    y_test.mean(),
-    color="gray",
-    linestyle="--",
-    lw=1,
-    label=f"Random Baseline (AP = {y_test.mean():.2f})",
-)
-axes[0].set_xlabel("Recall", fontsize=12)
-axes[0].set_ylabel("Precision", fontsize=12)
-axes[0].set_title("Precision-Recall Curve", fontsize=13, fontweight="bold")
-axes[0].legend(fontsize=10)
-axes[0].grid(True, alpha=0.3)
+    axes[1].plot(thr, f1_thr, color="#3498db", lw=2)
+    axes[1].axvline(
+        optimal_threshold,
+        color="#e74c3c",
+        linestyle="--",
+        lw=1.5,
+        label=f"Optimal threshold = {optimal_threshold:.3f}",
+    )
+    axes[1].set_xlabel("Decision Threshold", fontsize=12)
+    axes[1].set_ylabel("F1 Score (Churned)", fontsize=12)
+    axes[1].set_title(
+        "F1 Score vs Decision Threshold\n(evaluated on val set)",
+        fontsize=13,
+        fontweight="bold",
+    )
+    axes[1].legend(fontsize=10)
+    axes[1].grid(True, alpha=0.3)
 
-axes[1].plot(thr, f1_thr, color="#3498db", lw=2)
-axes[1].axvline(
-    optimal_threshold,
-    color="#e74c3c",
-    linestyle="--",
-    lw=1.5,
-    label=f"Optimal threshold = {optimal_threshold:.3f}",
-)
-axes[1].set_xlabel("Decision Threshold", fontsize=12)
-axes[1].set_ylabel("F1 Score (Churned)", fontsize=12)
-axes[1].set_title(
-    "F1 Score vs Decision Threshold\n(evaluated on val set)",
-    fontsize=13,
-    fontweight="bold",
-)
-axes[1].legend(fontsize=10)
-axes[1].grid(True, alpha=0.3)
+    plt.tight_layout()
+    save_fig("09_pr_curve_threshold.png")
 
-plt.tight_layout()
-save_fig("09_pr_curve_threshold.png")
+    print(
+        f"Default  threshold (0.50)  — Test F1 (churn): {f1_score(y_test, y_pred):.4f}"
+    )
+    print(
+        f"Optimal  threshold ({optimal_threshold:.3f}) — Test F1 (churn): "
+        f"{f1_score(y_test, y_pred_opt):.4f}"
+    )
+    print(f"\nClassification Report (optimal threshold = {optimal_threshold:.3f}):")
+    print(
+        classification_report(y_test, y_pred_opt, target_names=["Retained", "Churned"])
+    )
 
-print(
-    f"Default  threshold (0.50)  — Test F1 (churn): {f1_score(y_test, y_pred):.4f}"
-)
-print(
-    f"Optimal  threshold ({optimal_threshold:.3f}) — Test F1 (churn): "
-    f"{f1_score(y_test, y_pred_opt):.4f}"
-)
-print(f"\nClassification Report (optimal threshold = {optimal_threshold:.3f}):")
-print(
-    classification_report(y_test, y_pred_opt, target_names=["Retained", "Churned"])
-)
-
-# ── 4.9  Interpretability ─────────────────────────────────────────────────
-print("\n" + "=" * 65)
-print("STEP 9 — Interpretability analysis")
-print("=" * 65)
-
-# Weight-based importance: |W1| · |W2|  (normalised)
-weight_imp = (np.abs(final_model.W1) @ np.abs(final_model.W2)).flatten()
-weight_imp /= weight_imp.sum()
-
-# Permutation importance: mean AUC-ROC drop over 5 shuffles per feature
-baseline_auc = roc_auc_score(y_test, final_model.predict_proba(X_test))
-perm_imp = np.zeros(X_test.shape[1])
-for i in range(X_test.shape[1]):
-    drops = []
-    for _ in range(5):
-        X_p = X_test.copy()
-        np.random.shuffle(X_p[:, i])
-        drops.append(
-            baseline_auc - roc_auc_score(y_test, final_model.predict_proba(X_p))
+    # Save model after threshold optimization (optimal_threshold is now defined)
+    model_path = os.path.join(OUTPUT_DIR, "churn_model.pkl")
+    with open(model_path, "wb") as f:
+        pickle.dump(
+            {
+                "model": final_model,
+                "scaler": scaler,
+                "feature_names": feature_names,
+                "optimal_threshold": optimal_threshold,
+                "best_params": best_params,
+            },
+            f,
         )
-    perm_imp[i] = np.mean(drops)
+    print(f" Saved model → {model_path}")
 
-# Fig 10 — Feature importance (dual plot)
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+    # ── 4.9  Interpretability ─────────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print("STEP 9 — Interpretability analysis")
+    print("=" * 65)
 
-idx_w = np.argsort(weight_imp)
-ax1.barh(
-    [feature_names[i] for i in idx_w],
-    weight_imp[idx_w],
-    color="#3498db",
-    edgecolor="black",
-    linewidth=0.5,
-)
-ax1.set_xlabel("Normalised Weight Importance")
-ax1.set_title(
-    "Weight-Based Feature Importance\n(|W₁| · |W₂|)", fontsize=13, fontweight="bold"
-)
+    # Weight-based importance: |W1| · |W2|  (normalised)
+    weight_imp = (np.abs(final_model.W1) @ np.abs(final_model.W2)).flatten()
+    weight_imp /= weight_imp.sum()
 
-idx_p = np.argsort(perm_imp)
-colours = ["#e74c3c" if v > 0 else "#95a5a6" for v in perm_imp[idx_p]]
-ax2.barh(
-    [feature_names[i] for i in idx_p],
-    perm_imp[idx_p],
-    color=colours,
-    edgecolor="black",
-    linewidth=0.5,
-)
-ax2.set_xlabel("Mean AUC-ROC Drop (higher = more important)")
-ax2.set_title(
-    "Permutation Feature Importance\n(AUC-ROC decrease when shuffled)",
-    fontsize=13,
-    fontweight="bold",
-)
+    # Permutation importance: mean AUC-ROC drop over 5 shuffles per feature
+    baseline_auc = roc_auc_score(y_test, final_model.predict_proba(X_test))
+    perm_imp = np.zeros(X_test.shape[1])
+    for i in range(X_test.shape[1]):
+        drops = []
+        for _ in range(5):
+            X_p = X_test.copy()
+            np.random.shuffle(X_p[:, i])
+            drops.append(
+                baseline_auc - roc_auc_score(y_test, final_model.predict_proba(X_p))
+            )
+        perm_imp[i] = np.mean(drops)
 
-plt.tight_layout()
-save_fig("10_feature_importance.png")
+    # Fig 10 — Feature importance (dual plot)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
 
-# Print top-10 rankings
-print("\nTop 10 Features — Weight Importance:")
-for rank, i in enumerate(np.argsort(weight_imp)[::-1][:10], 1):
-    print(f"  {rank:2d}. {feature_names[i]:35s}  {weight_imp[i]:.4f}")
+    idx_w = np.argsort(weight_imp)
+    ax1.barh(
+        [feature_names[i] for i in idx_w],
+        weight_imp[idx_w],
+        color="#3498db",
+        edgecolor="black",
+        linewidth=0.5,
+    )
+    ax1.set_xlabel("Normalised Weight Importance")
+    ax1.set_title(
+        "Weight-Based Feature Importance\n(|W₁| · |W₂|)", fontsize=13, fontweight="bold"
+    )
 
-print("\nTop 10 Features — Permutation Importance:")
-for rank, i in enumerate(np.argsort(perm_imp)[::-1][:10], 1):
-    print(f"  {rank:2d}. {feature_names[i]:35s}  AUC drop: {perm_imp[i]:.4f}")
+    idx_p = np.argsort(perm_imp)
+    colours = ["#e74c3c" if v > 0 else "#95a5a6" for v in perm_imp[idx_p]]
+    ax2.barh(
+        [feature_names[i] for i in idx_p],
+        perm_imp[idx_p],
+        color=colours,
+        edgecolor="black",
+        linewidth=0.5,
+    )
+    ax2.set_xlabel("Mean AUC-ROC Drop (higher = more important)")
+    ax2.set_title(
+        "Permutation Feature Importance\n(AUC-ROC decrease when shuffled)",
+        fontsize=13,
+        fontweight="bold",
+    )
 
-# Illustrative churn-risk profiles
-feat_means = X_train.mean(axis=0)
+    plt.tight_layout()
+    save_fig("10_feature_importance.png")
 
-high_risk = feat_means.copy()
-for fname, delta in [
-    ("Customer_Service_Calls", +2.0),
-    ("Cart_Abandonment_Rate", +2.0),
-    ("Lifetime_Value", -2.0),
-    ("Days_Since_Last_Purchase", +2.0),
-]:
-    if fname in feature_names:
-        high_risk[feature_names.index(fname)] += delta
+    # Print top-10 rankings
+    print("\nTop 10 Features — Weight Importance:")
+    for rank, i in enumerate(np.argsort(weight_imp)[::-1][:10], 1):
+        print(f"  {rank:2d}. {feature_names[i]:35s}  {weight_imp[i]:.4f}")
 
-low_risk = feat_means.copy()
-for fname, delta in [
-    ("Customer_Service_Calls", -1.5),
-    ("Cart_Abandonment_Rate", -1.5),
-    ("Lifetime_Value", +1.5),
-    ("Days_Since_Last_Purchase", -1.5),
-]:
-    if fname in feature_names:
-        low_risk[feature_names.index(fname)] += delta
+    print("\nTop 10 Features — Permutation Importance:")
+    for rank, i in enumerate(np.argsort(perm_imp)[::-1][:10], 1):
+        print(f"  {rank:2d}. {feature_names[i]:35s}  AUC drop: {perm_imp[i]:.4f}")
 
-p_high = final_model.predict_proba(high_risk.reshape(1, -1))[0]
-p_low = final_model.predict_proba(low_risk.reshape(1, -1))[0]
+    # Illustrative churn-risk profiles
+    feat_means = X_train.mean(axis=0)
 
-print("\nIllustrative churn-risk profiles:")
-print(f"  High-risk  (high calls, high abandonment, low LTV) : {p_high:.1%}")
-print(f"  Low-risk   (low calls,  low abandonment,  high LTV): {p_low:.1%}")
+    high_risk = feat_means.copy()
+    for fname, delta in [
+        ("Customer_Service_Calls", +2.0),
+        ("Cart_Abandonment_Rate", +2.0),
+        ("Lifetime_Value", -2.0),
+        ("Days_Since_Last_Purchase", +2.0),
+    ]:
+        if fname in feature_names:
+            high_risk[feature_names.index(fname)] += delta
 
-# ── Done ──────────────────────────────────────────────────────────────────
-print("\n" + "=" * 65)
-print(f"Pipeline complete.  All figures saved to  '{OUTPUT_DIR}/'")
-print("=" * 65)
+    low_risk = feat_means.copy()
+    for fname, delta in [
+        ("Customer_Service_Calls", -1.5),
+        ("Cart_Abandonment_Rate", -1.5),
+        ("Lifetime_Value", +1.5),
+        ("Days_Since_Last_Purchase", -1.5),
+    ]:
+        if fname in feature_names:
+            low_risk[feature_names.index(fname)] += delta
+
+    p_high = final_model.predict_proba(high_risk.reshape(1, -1))[0]
+    p_low = final_model.predict_proba(low_risk.reshape(1, -1))[0]
+
+    print("\nIllustrative churn-risk profiles:")
+    print(f"  High-risk  (high calls, high abandonment, low LTV) : {p_high:.1%}")
+    print(f"  Low-risk   (low calls,  low abandonment,  high LTV): {p_low:.1%}")
+
+    # ── Done ──────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    print(f"Pipeline complete.  All figures saved to  '{OUTPUT_DIR}/'")
+    print("=" * 65)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
