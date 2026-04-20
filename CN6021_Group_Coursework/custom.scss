@@ -1,0 +1,141 @@
+/*-- scss:defaults --*/
+$body-bg: #FFFFFF;
+$body-color: #333333;
+$link-color: #2563EB;
+$selection-bg: rgba(37, 99, 235, 0.1);
+
+// Typography
+$font-family-sans-serif: 'Inter', system-ui, -apple-system, sans-serif;
+$presentation-heading-font: 'Montserrat', sans-serif;
+
+/*-- scss:rules --*/
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=Montserrat:wght@700;800&display=swap');
+
+.reveal {
+  background-color: $body-bg;
+  font-family: $font-family-sans-serif;
+  font-size: 28px; // Reduced from 32px
+}
+
+.reveal .slides {
+  text-align: left;
+}
+
+// Slide Overrides
+.reveal .slide {
+  padding: 0 !important;
+}
+
+// Headings - Even More Compact
+.reveal h1, .reveal h2, .reveal h3, .reveal h4 {
+  font-family: $presentation-heading-font;
+  text-transform: none;
+  letter-spacing: -0.01em;
+  color: #1E293B;
+  margin-bottom: 0.2em;
+}
+
+.reveal h1 { 
+    font-size: 2.0em;
+    font-weight: 800; 
+    color: #2563EB; 
+    border-bottom: 3px solid #EFF6FF;
+    padding-bottom: 0.1em;
+}
+
+.reveal h2 { 
+    font-size: 1.4em;
+    font-weight: 700; 
+    color: #1E293B;
+    border-left: 6px solid #2563EB;
+    padding-left: 0.4em;
+    margin-bottom: 0.3em;
+}
+
+.reveal h3 { 
+    font-size: 1.0em;
+    font-weight: 600; 
+    color: #3B82F6; 
+    margin-top: 0.1em;
+    margin-bottom: 0.1em;
+}
+
+// Content Elements - More compact
+.reveal p, .reveal li {
+  color: #475569;
+  line-height: 1.4;
+  font-size: 0.9em;
+}
+
+.reveal li::marker {
+  color: #2563EB;
+}
+
+// Code Blocks - Professional Dark Card
+.reveal pre {
+  background: #1E293B;
+  border-radius: 8px;
+  padding: 15px;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+}
+
+.reveal pre code {
+  color: #F8FAFC;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.75em; // Reduced from 0.85em
+}
+
+// Tables - Clean & Modern
+.reveal table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 15px 0;
+  border: 1px solid #E2E8F0;
+  font-size: 0.7em; // Reduced from 0.8em
+}
+
+.reveal table th {
+  background: #F8FAFC;
+  color: #1E293B;
+  font-weight: 600;
+  padding: 12px;
+  border-bottom: 2px solid #E2E8F0;
+}
+
+.reveal table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #F1F5F9;
+  color: #475569;
+}
+
+// Callouts
+.callout {
+    background: #EFF6FF !important;
+    border-left-color: #2563EB !important;
+    border-radius: 4px;
+    color: #1E3A8A !important;
+}
+
+.callout-title {
+    color: #1E40AF !important;
+}
+
+// Image Scaling to prevent overflow
+.reveal img {
+    max-height: 55vh;
+    width: auto;
+    object-fit: contain;
+    border-radius: 8px;
+    box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1);
+}
+
+// Footer Styling
+.reveal .footer {
+    color: #94A3B8;
+    font-size: 0.4em;
+}
+
+// Progress Bar
+.reveal .progress {
+    color: #2563EB;
+}
