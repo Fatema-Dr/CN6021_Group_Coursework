@@ -1,0 +1,143 @@
+/*-- scss:defaults --*/
+$body-bg: #000000;
+$body-color: #F1F5F9;
+$link-color: #38BDF8;
+$selection-bg: rgba(56, 189, 248, 0.1);
+
+// Typography
+$font-family-sans-serif: 'Inter', system-ui, -apple-system, sans-serif;
+$presentation-heading-font: 'Montserrat', sans-serif;
+
+/*-- scss:rules --*/
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=Montserrat:wght@700;800&display=swap');
+
+.reveal {
+  background-color: $body-bg;
+  font-family: $font-family-sans-serif;
+  font-size: 28px;
+  color: $body-color;
+}
+
+.reveal .slides {
+  text-align: left;
+}
+
+// Slide Overrides
+.reveal .slide {
+  padding: 0 !important;
+}
+
+// Headings - Dark Mode Optimized
+.reveal h1, .reveal h2, .reveal h3, .reveal h4 {
+  font-family: $presentation-heading-font;
+  text-transform: none;
+  letter-spacing: -0.01em;
+  color: #F8FAFC;
+  margin-bottom: 0.2em;
+}
+
+.reveal h1 { 
+    font-size: 2.0em;
+    font-weight: 800; 
+    color: #38BDF8; 
+    border-bottom: 3px solid #1E293B;
+    padding-bottom: 0.1em;
+}
+
+.reveal h2 { 
+    font-size: 1.4em;
+    font-weight: 700; 
+    color: #F1F5F9;
+    border-left: 6px solid #38BDF8;
+    padding-left: 0.4em;
+    margin-bottom: 0.3em;
+}
+
+.reveal h3 { 
+    font-size: 1.0em;
+    font-weight: 600; 
+    color: #7DD3FC; 
+    margin-top: 0.1em;
+    margin-bottom: 0.1em;
+}
+
+// Content Elements
+.reveal p, .reveal li {
+  color: #CBD5E1;
+  line-height: 1.4;
+  font-size: 0.9em;
+}
+
+.reveal li::marker {
+  color: #38BDF8;
+}
+
+.reveal strong {
+  color: #F8FAFC;
+}
+
+// Code Blocks
+.reveal pre {
+  background: #1E293B;
+  border-radius: 8px;
+  padding: 15px;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5);
+  border: 1px solid #334155;
+}
+
+.reveal pre code {
+  color: #F8FAFC;
+  font-family: 'Fira Code', monospace;
+  font-size: 0.75em;
+}
+
+// Tables - Dark Contrast
+.reveal table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 15px 0;
+  border: 1px solid #334155;
+  font-size: 0.7em;
+  background: #0F172A;
+}
+
+.reveal table th {
+  background: #1E293B;
+  color: #F8FAFC;
+  font-weight: 600;
+  padding: 12px;
+  border-bottom: 2px solid #334155;
+}
+
+.reveal table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #1E293B;
+  color: #CBD5E1;
+}
+
+// Image Styling
+.reveal img {
+    max-height: 55vh;
+    width: auto;
+    object-fit: contain;
+    border-radius: 8px;
+    box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.7);
+    border: 1px solid #1E293B;
+    background-color: white; // Keep plots clean if they have transparency issues
+}
+
+// Footer Styling
+.reveal .footer {
+    color: #475569;
+    font-size: 0.4em;
+}
+
+// Progress Bar
+.reveal .progress {
+    color: #38BDF8;
+}
+
+// Slide Numbers
+.reveal .slide-number {
+    color: #475569;
+}
