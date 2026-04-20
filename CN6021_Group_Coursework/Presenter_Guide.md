@@ -1,13 +1,16 @@
 # Presenter Script & Technical Guide
 ## Project: Customer Churn Prediction (CN6021)
-
-This document is designed to help a presenter deliver the "Customer Churn Prediction" slide deck. It provides a suggested script for every slide, technical explanations for the audience's benefit, and a glossary of terms.
+### Team Members & Role Assignments:
+1. **Shyam Vijay Jagani (2611208)**: Introduction & Exploratory Data Analysis (Slides 1-7)
+2. **Jasmi Alasapuri (2571395)**: Methodology & Technical Architecture (Slides 8-11)
+3. **Fatema Doctor (2604383)**: Training, Results & Final Performance (Slides 12-16)
+4. **Parth Rathwa (2509367)**: Business Impact, Action Plan & Conclusion (Slides 17-22)
 
 ---
 
 ## 🖼️ Slide-by-Slide Breakdown
 
-### Part 1: Problem Definition
+### 👤 Part 1: Problem Definition (Presenter: Shyam Vijay Jagani)
 - **Slide 1 (Title):** "Welcome everyone. Today we are presenting our project on Customer Churn Prediction. We developed a custom shallow neural network from scratch to identify which customers are most likely to leave, allowing for proactive retention strategies."
 - **Slide 2 (# Problem Definition & Dataset):** "In this first section, we'll define the business problem and look at the characteristics of the data we used to train our AI."
 - **Slide 3 (## Project Objective):** "Our goal was to build an automated system for an e-commerce subscription service. We dealt with 50,000 customers and 25 behavioral features. A critical challenge was the 28.9% churn rate, meaning our data is 'imbalanced'—most customers stay, which makes finding the ones who leave like finding a needle in a haystack."
@@ -18,7 +21,7 @@ This document is designed to help a presenter deliver the "Customer Churn Predic
   - **Non-linear Relations:** Complex patterns where the outcome isn't just a simple straight-line relationship (e.g., age alone doesn't predict churn, but age *combined* with purchase history might).
   - **High Dimensionality:** Having a large number of features (25+). This provides more detail but can also confuse the model with "irrelevant noise."
 
-### Part 2: EDA
+### 👤 Part 2: EDA (Presenter: Shyam Vijay Jagani)
 - **Slide 4 (# Exploratory Data Analysis):** "Before building the model, we performed EDA to find the 'signal in the noise' and discover what actually drives customer behavior."
 - **Slide 5 (## Target Distribution):** "Almost 71% of our data is retained. If a model just guessed 'No Churn' every time, it would be 71% accurate but totally useless for the business. That's why we prioritize AUC-ROC and Weighted Loss to ensure we capture the minority churn class."
 
@@ -40,7 +43,7 @@ This document is designed to help a presenter deliver the "Customer Churn Predic
   - **PCA (Principal Component Analysis):** A technique to squash 25 features down into 2D (PC1 and PC2) so we can "see" the data structure. It shows how distinct or overlapping our classes are.
   - **Feature Distributions:** Histograms showing how values (like Age or Credit) spread across churners vs. retained customers.
 
-### Part 3: Methodology
+### 👤 Part 3: Methodology (Presenter: Jasmi Alasapuri)
 - **Slide 8 (# Methodology & Engineering):** "This section covers how we cleaned the data and the math behind our custom-built neural network."
 - **Slide 9 (## Feature Selection Pipeline):** "We handled outliers, imputed missing values, and scaled the data. Crucially, we used Mutual Information to select the top 25 features that have the strongest relationship with churn."
 
@@ -66,7 +69,7 @@ This document is designed to help a presenter deliver the "Customer Churn Predic
   - **Early Stopping (Patience):** We set the model to stop training automatically if it stops improving on new data. This prevents it from "overloading."
   - **Epoch:** One complete pass of the entire dataset through the neural network.
 
-### Part 4: Training & Results
+### 👤 Part 4: Training & Results (Presenter: Fatema Doctor)
 - **Slide 12 (# Training & Results):** "Now we look at the results of our hyperparameter tuning and how the model learned over time."
 - **Slide 13 (## Optimization Strategy):** "We ran 27 different configurations of learning rates and layer sizes. We found that a learning rate of 0.05 hit the highest F1-Score, giving us the most balanced performance."
 
@@ -83,7 +86,7 @@ This document is designed to help a presenter deliver the "Customer Churn Predic
   - **Overfitting:** When a model "memorizes" specific data points (noise) instead of learning the general pattern.
   - **Generalization:** The ability of the model to work correctly on "unseen" customers it wasn't trained on.
 
-### Part 5: Final Performance
+### 👤 Part 5: Final Performance (Presenter: Fatema Doctor)
 - **Slide 15 (# Final Performance):** "The bottom line: how does the model perform on completely new, unseen customers?"
 - **Slide 16 (## Evaluation Metrics):** "We hit an AUC-ROC of 0.91—an excellent score. Our Precision and Recall are balanced at 81%, meaning we successfully minimize both missed churners and unnecessary outreach costs."
 
@@ -93,7 +96,7 @@ This document is designed to help a presenter deliver the "Customer Churn Predic
   - **Precision:** "Out of everyone we called a churner, how many actually were?"
   - **Recall:** "Out of everyone who actually churned, how many did we successfully find?"
 
-### Part 6: Business Impact
+### 👤 Part 6: Business Impact (Presenter: Parth Rathwa)
 - **Slide 17 (# Business Impact):** "Finally, let's translate these technical metrics into actionable business strategies."
 - **Slide 18 (## Feature Importance):** "Our model identifies Customer Service Calls and Cart Abandonment as the primary indicators of churn. This gives the marketing and support teams clear areas to focus on."
 
@@ -103,7 +106,7 @@ This document is designed to help a presenter deliver the "Customer Churn Predic
 
 - **Slide 19 (## Retention Action Plan):** "We recommend targeted outreach for anyone with more than 3 calls, and win-back flows for those with high abandonment. This data-driven approach is far more efficient than mass marketing."
 
-### Part 7: Conclusion
+### 👤 Part 7: Conclusion (Presenter: Parth Rathwa)
 - **Slide 20 (# Conclusion):** "To wrap up our findings and look at the path forward..."
 - **Slide 21 (## Summary):** "We delivered a robust, scratch-built Neural Network with balanced metrics and explainable insights that directly support business retention goals."
 - **Slide 22 (## Q&A):** "Thank you for your time. Are there any questions regarding the implementation, the math, or the business strategy?"

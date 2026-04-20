@@ -1,8 +1,11 @@
 ---
 title: "Customer Churn Prediction"
 subtitle: "Using a Custom Shallow Neural Network"
-author: "CN6021: Advanced Topics in AI and Data-Science"
-date: "2026-04-20"
+author: 
+  - "Shyam Vijay Jagani (2611208)"
+  - "Jasmi Alasapuri (2571395)"
+  - "Fatema Doctor (2604383)"
+  - "Parth Rathwa (2509367)"
 format: 
   revealjs:
     theme: [default, custom_dark.scss]
