@@ -146,6 +146,49 @@ CN6021_Group_Coursework/
     └── churn_model.pkl
 ```
 
+# Task 2: 3D Brain Tumour Segmentation
+
+## Overview
+
+This task focuses on building an automated system to detect and segment brain tumours from 3D MRI scans using a **3D Convolutional Neural Network (U-Net)** in PyTorch. The project addresses challenges such as 3D data handling, varied tumour sizes, severe class imbalance, and memory management.
+
+**Dataset:** [BraTS 2024 GLI (Adult Glioma)](https://www.synapse.org/#!Synapse:syn59059776) downloaded automatically via the Synapse API.
+
+## Features & Approach
+
+1. **Automated Data Fetching**: Uses `synapseclient` to authenticate, download, and extract the dataset using `p7zip`.
+2. **Custom PyTorch Dataset**: Implements a memory-efficient `DataLoader` with patch-based sampling (96x96x96) and foreground-biased sampling.
+3. **3D Data Augmentation**: On-the-fly random flips, 90° rotations, elastic deformations, and intensity shifts to improve generalization.
+4. **Architecture**: 3D U-Net with skip connections, 3D convolutions, batch normalization, and dropout. Includes a transfer learning helper to inflate 2D weights into 3D.
+5. **Loss Functions**: A combined Soft Dice Loss (to combat class imbalance) and Cross-Entropy Loss (for stable gradients).
+6. **Training Loop**: Automatic Mixed Precision (AMP), gradient clipping, and cosine annealing learning rate scheduler. 
+7. **Evaluation**: Metrics include Dice score, Intersection over Union (IoU), and Hausdorff distance.
+8. **Visualizations**: Outputs training curves, Dice scores per class, and multi-panel axial slice visualisations.
+
+For a detailed explanation of how the code works and the rationale behind the dataset choice, see [Task2_Explanation.md](Task2_Explanation.md).
+
+## Usage
+
+### Prerequisites
+- Python 3.8+
+- Synapse Account (for dataset downloading)
+- p7zip (for extracting the downloaded `.zip` or `.7z` archives)
+
+### Setup & Run
+```bash
+# 1. Install dependencies
+pip install -r task2_requirements.txt
+
+# 2. Add your Synapse token to a `.env` file
+echo "SYNAPSE_AUTH_TOKEN=your_token_here" > .env
+
+# 3. Run the script (this will auto-download the dataset if needed)
+python task2_brain_tumour_segmentation.py
+
+# Or run with synthetic data for a quick test without downloading:
+python task2_brain_tumour_segmentation.py --synthetic
+```
+
 ## License
 
 This project is for educational purposes as part of CN6021 — Advanced Topics in AI and Data Science.

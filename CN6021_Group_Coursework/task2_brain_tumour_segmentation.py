@@ -6,16 +6,17 @@ Task 2: 3D Brain Tumour Segmentation from MRI Scans
 
 Architecture : 3D U-Net (encoder–decoder with skip connections)
 Framework    : PyTorch
-Dataset      : BraTS 2020  (or compatible NIfTI dataset)
-               Expected layout:
+Dataset      : BraTS 2024 GLI (Adult Glioma) — downloaded via Synapse API
+               Synapse ID: syn59059776
+               Expected layout (auto-created by download step):
                  data/
-                   BraTS2020_TrainingData/
-                     BraTS20_Training_001/
-                       BraTS20_Training_001_flair.nii.gz
-                       BraTS20_Training_001_t1.nii.gz
-                       BraTS20_Training_001_t1ce.nii.gz
-                       BraTS20_Training_001_t2.nii.gz
-                       BraTS20_Training_001_seg.nii.gz
+                   BraTS2024_GLI/
+                     BraTS-GLI-XXXXX-XXX/
+                       BraTS-GLI-XXXXX-XXX-t1n.nii.gz
+                       BraTS-GLI-XXXXX-XXX-t1c.nii.gz
+                       BraTS-GLI-XXXXX-XXX-t2w.nii.gz
+                       BraTS-GLI-XXXXX-XXX-t2f.nii.gz
+                       BraTS-GLI-XXXXX-XXX-seg.nii.gz
                      ...
 
 Pipeline
@@ -43,8 +44,8 @@ Outputs (all written to  outputs/ )
 
 Usage
 -----
-  # full training run
-  python task2_brain_tumour_segmentation.py
+  # download BraTS 2024 data + full training run
+  python task2_brain_tumour_segmentation.py --auth-token YOUR_SYNAPSE_TOKEN
 
   # quick smoke-test with synthetic data (no BraTS needed)
   python task2_brain_tumour_segmentation.py --synthetic
@@ -105,27 +106,43 @@ except ImportError:
     print("WARNING: scipy not found. Elastic deformation & Hausdorff disabled.")
     print("         Install with:  pip install scipy\n")
 
+# synapseclient for downloading BraTS 2024 data from Synapse
+try:
+    import synapseclient
+    import synapseutils
+    SYNAPSE_AVAILABLE = True
+except ImportError:
+    SYNAPSE_AVAILABLE = False
+    print("WARNING: synapseclient not found. Auto-download disabled.")
+    print("         Install with:  pip install synapseclient\n")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 class Config:
     # ── Paths ──────────────────────────────────────────────────────────────────
-    DATA_ROOT      = Path("data/BraTS2020_TrainingData")
+    DATA_ROOT      = Path("data/BraTS2024_GLI")
     OUTPUT_DIR     = Path("outputs")
     CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
     RESULTS_DIR    = OUTPUT_DIR / "results"
     PRED_DIR       = RESULTS_DIR / "sample_predictions"
 
+    # ── Synapse download ──────────────────────────────────────────────────────
+    SYNAPSE_ID     = "syn59059776"       # BraTS 2024 GLI (Adult Glioma)
+
     # ── Data ───────────────────────────────────────────────────────────────────
-    MODALITIES     = ["flair", "t1ce"]   # use FLAIR + T1ce (most informative)
+    # BraTS 2024 modality suffixes:  t1n, t1c, t2w, t2f
+    # We use T2-FLAIR (t2f) + post-contrast T1 (t1c) — most informative pair
+    MODALITIES     = ["t2f", "t1c"]
     IN_CHANNELS    = len(MODALITIES)     # 2
-    # BraTS segmentation labels:
-    #   0 = background, 1 = necrotic core, 2 = oedema, 4 = enhancing tumour
-    # We merge into 3 foreground classes + background  → 4 output channels
+    # BraTS 2024 segmentation labels:
+    #   0 = background, 1 = NCR/NET (necrotic core), 2 = ED (oedema),
+    #   3 = ET (enhancing tumour)
+    # Labels are already contiguous 0–3, no remapping needed
     NUM_CLASSES    = 4
     CLASS_NAMES    = ["Background", "Necrotic Core", "Oedema", "Enhancing"]
-    LABEL_REMAP    = {0: 0, 1: 1, 2: 2, 4: 3}   # remap label-4 → 3
+    LABEL_REMAP    = {0: 0, 1: 1, 2: 2, 3: 3}   # identity (BraTS 2024)
 
     # ── Patch-based training ───────────────────────────────────────────────────
     PATCH_SIZE     = (96, 96, 96)        # D × H × W  (128³ needs ≥16 GB VRAM)
@@ -349,16 +366,16 @@ class BraTSDataset(Dataset):
         name   = patient_dir.name
         imgs   = []
         for mod in self.cfg.MODALITIES:
-            nii_path = patient_dir / f"{name}_{mod}.nii.gz"
+            nii_path = patient_dir / f"{name}-{mod}.nii.gz"
             if not nii_path.exists():
-                nii_path = patient_dir / f"{name}_{mod}.nii"
+                nii_path = patient_dir / f"{name}-{mod}.nii"
             vol = nib.load(str(nii_path)).get_fdata(dtype=np.float32)
             imgs.append(normalise_volume(vol))
         img = np.stack(imgs, axis=0)                       # (C, D, H, W)
 
-        seg_path = patient_dir / f"{name}_seg.nii.gz"
+        seg_path = patient_dir / f"{name}-seg.nii.gz"
         if not seg_path.exists():
-            seg_path = patient_dir / f"{name}_seg.nii"
+            seg_path = patient_dir / f"{name}-seg.nii"
         seg = nib.load(str(seg_path)).get_fdata().astype(np.int64)
         seg = remap_labels(seg, self.cfg.LABEL_REMAP)      # (D, H, W)
 
@@ -1407,6 +1424,47 @@ def plot_model_architecture_summary(model: nn.Module, cfg: Config) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 11b. Data Downloading 
+# ─────────────────────────────────────────────────────────────────────────────
+def download_brats_data(cfg: Config, auth_token: Optional[str] = None) -> None:
+    if not SYNAPSE_AVAILABLE:
+        print("Synapse client not available. Cannot download.")
+        return
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+    token = auth_token or os.environ.get("SYNAPSE_AUTH_TOKEN")
+    if not token:
+        print("No SYNAPSE_AUTH_TOKEN found in environment or .env file.")
+        print("Please add it to .env or pass it via --auth-token.")
+        return
+
+    print("Authenticating with Synapse...")
+    syn = synapseclient.Synapse()
+    syn.login(authToken=token)
+
+    print(f"Downloading dataset {cfg.SYNAPSE_ID} to {cfg.DATA_ROOT}...")
+    cfg.DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    
+    files = synapseutils.syncFromSynapse(syn, entity=cfg.SYNAPSE_ID, path=str(cfg.DATA_ROOT))
+    
+    import subprocess
+    for f in files:
+        filepath = f.path
+        if filepath.endswith('.zip') or filepath.endswith('.7z'):
+            print(f"Extracting {filepath} using p7zip...")
+            try:
+                subprocess.run(['7z', 'x', filepath, f'-o{cfg.DATA_ROOT}', '-y'], check=True)
+            except FileNotFoundError:
+                print("WARNING: p7zip (7z) not found. Please install it to extract archives.")
+            except subprocess.CalledProcessError as e:
+                print(f"WARNING: Failed to extract {filepath}: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 12.  Dataset factory  (real BraTS  or  synthetic)
 # ─────────────────────────────────────────────────────────────────────────────
 def build_datasets(
@@ -1470,6 +1528,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--synthetic", action="store_true",
                    help="Use synthetic data (no BraTS required)")
+    p.add_argument("--auth-token", type=str, default=None,
+                   help="Synapse auth token (overrides .env)")
+    p.add_argument("--download", action="store_true",
+                   help="Download dataset from Synapse before running")
     p.add_argument("--eval", action="store_true",
                    help="Evaluate only (requires --checkpoint)")
     p.add_argument("--checkpoint", type=str, default=None,
@@ -1496,6 +1558,12 @@ def main() -> None:
     print(f"Device : {cfg.DEVICE.upper()}")
     print(f"PyTorch: {torch.__version__}")
     print("=" * 65)
+
+    if args.auth_token:
+        os.environ["SYNAPSE_AUTH_TOKEN"] = args.auth_token
+
+    if args.download or args.auth_token:
+        download_brats_data(cfg, args.auth_token)
 
     # ── Build datasets ────────────────────────────────────────────────────────
     print("\nSTEP 1 — Building datasets")
