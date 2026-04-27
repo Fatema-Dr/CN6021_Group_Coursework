@@ -7,3 +7,4 @@ scipy
 synapseclient
 python-dotenv
 p7zip
+tqdm

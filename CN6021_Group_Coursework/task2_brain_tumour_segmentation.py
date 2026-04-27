@@ -47,10 +47,7 @@ Usage
   # download BraTS 2024 data + full training run
   python task2_brain_tumour_segmentation.py --auth-token YOUR_SYNAPSE_TOKEN
 
-  # quick smoke-test with synthetic data (no BraTS needed)
-  python task2_brain_tumour_segmentation.py --synthetic
-
-  # evaluate a saved checkpoint
+# evaluate a saved checkpoint
   python task2_brain_tumour_segmentation.py --eval --checkpoint outputs/checkpoints/best_model.pth
 """
 
@@ -122,7 +119,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 class Config:
     # ── Paths ──────────────────────────────────────────────────────────────────
-    DATA_ROOT      = Path("data/BraTS2024_GLI")
+DATA_ROOT = Path("data/BraTS2024_GLI")
     OUTPUT_DIR     = Path("outputs")
     CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
     RESULTS_DIR    = OUTPUT_DIR / "results"
@@ -430,11 +427,7 @@ class BraTSDataset(Dataset):
         patient_idx = idx % len(self.patient_dirs)
         patient_dir = self.patient_dirs[patient_idx]
 
-        if NIBABEL_AVAILABLE:
-            img, seg = self._load_patient(patient_dir)
-        else:
-            # Fallback: synthetic volume
-            img, seg = make_synthetic_volume(self.cfg)
+img, seg = self._load_patient(patient_dir)
 
         centre      = self._sample_patch_centre(seg)
         img_p, seg_p = self._extract_patch(img, seg, centre)
@@ -1426,6 +1419,12 @@ def plot_model_architecture_summary(model: nn.Module, cfg: Config) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # 11b. Data Downloading 
 # ─────────────────────────────────────────────────────────────────────────────
+def _data_exists(cfg: Config) -> bool:
+    if not cfg.DATA_ROOT.exists():
+        return False
+    patient_dirs = [d for d in cfg.DATA_ROOT.iterdir() if d.is_dir() and "BraTS" in d.name]
+    return len(patient_dirs) > 0
+
 def download_brats_data(cfg: Config, auth_token: Optional[str] = None) -> None:
     if not SYNAPSE_AVAILABLE:
         print("Synapse client not available. Cannot download.")
@@ -1443,15 +1442,19 @@ def download_brats_data(cfg: Config, auth_token: Optional[str] = None) -> None:
         print("Please add it to .env or pass it via --auth-token.")
         return
 
+    if _data_exists(cfg):
+        print(f"Data already exists at {cfg.DATA_ROOT}. Skipping download.")
+        return
+
     print("Authenticating with Synapse...")
     syn = synapseclient.Synapse()
     syn.login(authToken=token)
 
     print(f"Downloading dataset {cfg.SYNAPSE_ID} to {cfg.DATA_ROOT}...")
     cfg.DATA_ROOT.mkdir(parents=True, exist_ok=True)
-    
+
     files = synapseutils.syncFromSynapse(syn, entity=cfg.SYNAPSE_ID, path=str(cfg.DATA_ROOT))
-    
+
     import subprocess
     for f in files:
         filepath = f.path
@@ -1468,39 +1471,23 @@ def download_brats_data(cfg: Config, auth_token: Optional[str] = None) -> None:
 # 12.  Dataset factory  (real BraTS  or  synthetic)
 # ─────────────────────────────────────────────────────────────────────────────
 def build_datasets(
-    cfg: Config, synthetic: bool = False
+    cfg: Config,
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
     Returns (train_dataset, val_dataset, test_dataset).
-    If  synthetic=True  or BraTS data is unavailable, uses SyntheticDataset.
+    Uses BraTS data from DATA_ROOT.
     """
-    use_synthetic = synthetic or not NIBABEL_AVAILABLE
-    patient_dirs  = []   # always initialised — avoids UnboundLocalError
+if not cfg.DATA_ROOT.exists():
+        raise FileNotFoundError(f"Data root not found: {cfg.DATA_ROOT}")
 
-    if not use_synthetic:
-        if not cfg.DATA_ROOT.exists():
-            print(f"  Data root not found: {cfg.DATA_ROOT}")
-            print("  Switching to synthetic data.")
-            use_synthetic = True
-        else:
-            patient_dirs = sorted([
-                d for d in cfg.DATA_ROOT.iterdir()
-                if d.is_dir() and "BraTS" in d.name
-            ])
-            if len(patient_dirs) == 0:
-                print("  No patient directories found — switching to synthetic data.")
-                use_synthetic = True
+    patient_dirs = sorted([
+        d for d in cfg.DATA_ROOT.iterdir()
+        if d.is_dir() and "BraTS" in d.name
+    ])
+    if len(patient_dirs) == 0:
+        raise ValueError("No patient directories found in DATA_ROOT")
 
-    if use_synthetic:
-        print("  Using SYNTHETIC data (no BraTS dataset required)")
-        n_train, n_val, n_test = 40, 10, 10
-        train_ds = SyntheticDataset(n_train, cfg, augment=True)
-        val_ds   = SyntheticDataset(n_val,   cfg, augment=False)
-        test_ds  = SyntheticDataset(n_test,  cfg, augment=False)
-        return train_ds, val_ds, test_ds
-
-    # Real BraTS split
-    n     = len(patient_dirs)
+    n = len(patient_dirs)
     n_test = max(1, int(n * cfg.TEST_SPLIT))
     n_val  = max(1, int(n * cfg.VAL_SPLIT))
     n_tr   = n - n_val - n_test
@@ -1526,8 +1513,6 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="CN6021 Task 2 — 3D Brain Tumour Segmentation"
     )
-    p.add_argument("--synthetic", action="store_true",
-                   help="Use synthetic data (no BraTS required)")
     p.add_argument("--auth-token", type=str, default=None,
                    help="Synapse auth token (overrides .env)")
     p.add_argument("--download", action="store_true",
@@ -1538,8 +1523,12 @@ def parse_args() -> argparse.Namespace:
                    help="Path to checkpoint for evaluation")
     p.add_argument("--no_hp_search", action="store_true",
                    help="Skip hyperparameter search, use default config")
-    p.add_argument("--epochs", type=int, default=None,
-                   help="Override number of training epochs")
+p.add_argument("--epochs", type=int, default=None,
+                 help="Override number of training epochs")
+    p.add_argument("--skip-eda", action="store_true",
+                 help="Skip EDA step")
+    p.add_argument("--eda-only", action="store_true",
+                 help="Run EDA only and exit")
     return p.parse_args()
 
 
@@ -1562,14 +1551,23 @@ def main() -> None:
     if args.auth_token:
         os.environ["SYNAPSE_AUTH_TOKEN"] = args.auth_token
 
-    if args.download or args.auth_token:
+    token = os.environ.get("SYNAPSE_AUTH_TOKEN")
+    if token or args.download:
         download_brats_data(cfg, args.auth_token)
 
+    # ── EDA ──────────────────────────────────────────────────────────────────
+    if not args.skip_eda:
+        print("\nSTEP 1 — Exploratory Data Analysis")
+        from task2_eda import run_eda
+        run_eda(cfg, cfg.DATA_ROOT, cfg.RESULTS_DIR)
+
+    if args.eda_only:
+        print("\nEDA complete. Exiting (--eda-only flag).")
+        return
+
     # ── Build datasets ────────────────────────────────────────────────────────
-    print("\nSTEP 1 — Building datasets")
-    train_ds, val_ds, test_ds = build_datasets(
-        cfg, synthetic=args.synthetic
-    )
+    print("\nSTEP 2 — Building datasets")
+    train_ds, val_ds, test_ds = build_datasets(cfg)
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.BATCH_SIZE,
@@ -1597,42 +1595,42 @@ def main() -> None:
         save_sample_predictions(model, test_ds, cfg, n=cfg.SAVE_VIS_N)
         return
 
-    # ── Hyperparameter search ─────────────────────────────────────────────────
-    if not args.no_hp_search:
-        print("\nSTEP 2 — Hyperparameter search")
-        best_hp = hyperparameter_search(train_ds, val_ds, cfg)
-        cfg.LR           = best_hp["lr"]
-        cfg.BASE_FILTERS = best_hp["base_filters"]
-        cfg.DICE_WEIGHT  = best_hp["dice_weight"]
-        cfg.BCE_WEIGHT   = 1.0 - cfg.DICE_WEIGHT
-        # Restore full epoch count after search
-        cfg.EPOCHS = Config.EPOCHS
-    else:
-        print("\nSTEP 2 — Skipping hyperparameter search (using defaults)")
+# ── Hyperparameter search ─────────────────────────────────────────────────
+if not args.no_hp_search:
+    print("\nSTEP 3 — Hyperparameter search")
+    best_hp = hyperparameter_search(train_ds, val_ds, cfg)
+    cfg.LR = best_hp["lr"]
+    cfg.BASE_FILTERS = best_hp["base_filters"]
+    cfg.DICE_WEIGHT = best_hp["dice_weight"]
+    cfg.BCE_WEIGHT = 1.0 - cfg.DICE_WEIGHT
+    # Restore full epoch count after search
+    cfg.EPOCHS = Config.EPOCHS
+else:
+    print("\nSTEP 3 — Skipping hyperparameter search (using defaults)")
 
-    # ── Build final model ─────────────────────────────────────────────────────
-    print("\nSTEP 3 — Building 3D U-Net")
-    set_seed(cfg.SEED)
-    model = UNet3D(cfg).to(cfg.DEVICE)
-    plot_model_architecture_summary(model, cfg)
+# ── Build final model ─────────────────────────────────────────────────────
+print("\nSTEP 4 — Building 3D U-Net")
+set_seed(cfg.SEED)
+model = UNet3D(cfg).to(cfg.DEVICE)
+plot_model_architecture_summary(model, cfg)
 
-    # ── Train ─────────────────────────────────────────────────────────────────
-    print("\nSTEP 4 — Training")
-    history = train(model, train_loader, val_loader, cfg)
-    plot_training_curves(history, cfg)
+# ── Train ─────────────────────────────────────────────────────────────────
+print("\nSTEP 5 — Training")
+history = train(model, train_loader, val_loader, cfg)
+plot_training_curves(history, cfg)
 
-    # ── Load best checkpoint for evaluation ───────────────────────────────────
-    print("\nSTEP 5 — Loading best checkpoint for test evaluation")
-    best_ckpt = str(cfg.CHECKPOINT_DIR / "best_model.pth")
-    if Path(best_ckpt).exists():
-        load_checkpoint(best_ckpt, model, cfg.DEVICE)
+# ── Load best checkpoint for evaluation ───────────────────────────────────
+print("\nSTEP 6 — Loading best checkpoint for test evaluation")
+best_ckpt = str(cfg.CHECKPOINT_DIR / "best_model.pth")
+if Path(best_ckpt).exists():
+    load_checkpoint(best_ckpt, model, cfg.DEVICE)
 
-    # ── Test evaluation ───────────────────────────────────────────────────────
-    print("\nSTEP 6 — Test evaluation")
-    metrics = test_evaluation(model, test_loader, cfg)
+# ── Test evaluation ───────────────────────────────────────────────────────
+print("\nSTEP 7 — Test evaluation")
+metrics = test_evaluation(model, test_loader, cfg)
 
-    # ── Visualisations ────────────────────────────────────────────────────────
-    print("\nSTEP 7 — Saving visualisations")
+# ── Visualisations ────────────────────────────────────────────────────────
+print("\nSTEP 8 — Saving visualisations")
     plot_dice_per_class(metrics, cfg)
     save_sample_predictions(model, test_ds, cfg, n=cfg.SAVE_VIS_N)
 
