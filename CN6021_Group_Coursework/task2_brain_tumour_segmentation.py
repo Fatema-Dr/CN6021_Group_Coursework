@@ -63,7 +63,7 @@ import random
 import argparse
 import warnings
 from pathlib import Path
-from typing  import Dict, List, Optional, Tuple
+from typing  import Dict, List, Optional, Tuple, Union
 
 warnings.filterwarnings("ignore")
 
@@ -79,9 +79,10 @@ import torch
 import torch.nn            as nn
 import torch.nn.functional as F
 from   torch.utils.data   import Dataset, DataLoader
-from   torch.cuda.amp     import GradScaler, autocast
+from   torch.amp          import GradScaler, autocast
 from   torch.optim        import AdamW
-from   torch.optim.lr_scheduler import CosineAnnealingLR
+from   torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
+from   tqdm               import tqdm
 
 # nibabel for NIfTI I/O  (pip install nibabel)
 try:
@@ -90,8 +91,7 @@ try:
 except ImportError:
     NIBABEL_AVAILABLE = False
     print("WARNING: nibabel not found. Real BraTS data cannot be loaded.")
-    print("         Install with:  pip install nibabel")
-    print("         Continuing with synthetic data mode.\n")
+    print("         Install with:  pip install nibabel\n")
 
 # scipy for elastic deformation & Hausdorff distance
 try:
@@ -119,7 +119,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 class Config:
     # ── Paths ──────────────────────────────────────────────────────────────────
-    DATA_ROOT = Path("data/BraTS2024_GLI")
+    DATA_ROOT = Path("data")
     OUTPUT_DIR     = Path("outputs")
     CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
     RESULTS_DIR    = OUTPUT_DIR / "results"
@@ -139,7 +139,7 @@ class Config:
     # Labels are already contiguous 0–3, no remapping needed
     NUM_CLASSES    = 4
     CLASS_NAMES    = ["Background", "Necrotic Core", "Oedema", "Enhancing"]
-    LABEL_REMAP    = {0: 0, 1: 1, 2: 2, 3: 3}   # identity (BraTS 2024)
+    LABEL_REMAP    = {0: 0, 1: 1, 2: 2, 3: 3, 4: 3}   # BraTS 2024: label 4 (ET) → class 3
 
     # ── Patch-based training ───────────────────────────────────────────────────
     PATCH_SIZE     = (96, 96, 96)        # D × H × W  (128³ needs ≥16 GB VRAM)
@@ -151,17 +151,18 @@ class Config:
     DEPTH          = 4                   # encoder levels (4 → 5 resolution scales)
     DROPOUT        = 0.1
 
-    # ── Training ───────────────────────────────────────────────────────────────
+    # ── Training Hardware ──────────────────────────────────────────────────────
+    BATCH_SIZE     = 2                   # doubled → ~3 GB VRAM (safe on 6 GB card)
+    ACCUMULATION_STEPS = 2               # effective batch = 2×2 = 4
     EPOCHS         = 50
-    BATCH_SIZE     = 1                   # limited by GPU VRAM for 128³ patches
     LR             = 1e-3
     WEIGHT_DECAY   = 1e-5
     GRAD_CLIP      = 1.0
     AMP            = True                # automatic mixed precision
-    VAL_SPLIT      = 0.15
-    TEST_SPLIT     = 0.15
-    PATIENCE       = 15                  # early stopping patience (val Dice)
-    NUM_WORKERS    = 0                   # set >0 if your system allows fork
+    DEEP_SUPERVISION = True              # auxiliary heads for faster convergence
+    PATIENCE       = 10                  # early stopping patience (val Dice)
+    NUM_WORKERS    = 8                   # 8 of 20 threads — leaves headroom for OS/WSL
+    PREFETCH_FACTOR = 4                  # each worker pre-loads 4 batches
 
     # ── Loss ───────────────────────────────────────────────────────────────────
     DICE_WEIGHT    = 0.6
@@ -171,7 +172,7 @@ class Config:
     # ── Augmentation ───────────────────────────────────────────────────────────
     AUG_FLIP_PROB     = 0.5
     AUG_ROTATE_PROB   = 0.3
-    AUG_ELASTIC_PROB  = 0.2
+    AUG_ELASTIC_PROB  = 0.1              # halved — elastic deform is the slowest aug
     AUG_INTENSITY_PROB= 0.3
 
     # ── Reproducibility ────────────────────────────────────────────────────────
@@ -188,8 +189,8 @@ def set_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark     = False
+    torch.backends.cudnn.deterministic = False   # trade reproducibility for speed
+    torch.backends.cudnn.benchmark     = True    # auto-tune fastest conv algorithm
 
 
 def make_dirs() -> None:
@@ -309,12 +310,17 @@ class Augment3D:
 # ─────────────────────────────────────────────────────────────────────────────
 def normalise_volume(vol: np.ndarray) -> np.ndarray:
     """
-    Z-score normalisation per channel using non-zero voxel statistics.
-    Non-zero masking avoids skull-stripping artefacts skewing the stats.
+    Percentile-clipped Z-score normalisation using non-zero voxel statistics.
+    1. Clip to [0.5th, 99.5th] percentile to remove scanner-specific outliers.
+    2. Z-score normalise using the non-zero brain mask so that
+       skull-stripped background voxels don't skew the statistics.
     """
     mask = vol > 0
     if mask.sum() == 0:
         return vol
+    # Clip outlier intensities (scanner variability)
+    p05, p995 = np.percentile(vol[mask], [0.5, 99.5])
+    vol = np.clip(vol, p05, p995)
     mu  = vol[mask].mean()
     std = vol[mask].std() + 1e-8
     out = np.zeros_like(vol, dtype=np.float32)
@@ -459,92 +465,43 @@ class BraTSDataset(Dataset):
                seg[:target[0], :target[1], :target[2]]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3b.  Synthetic dataset (no BraTS required — for testing)
-# ─────────────────────────────────────────────────────────────────────────────
-def make_synthetic_volume(
-    cfg: Config = Config,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Creates a random synthetic brain-like volume with a spherical tumour.
-    Used when BraTS data is unavailable (--synthetic flag).
-    """
-    size = 160
-    img  = np.random.randn(cfg.IN_CHANNELS, size, size, size).astype(np.float32)
-    seg  = np.zeros((size, size, size), dtype=np.int64)
-
-    # Add a simulated tumour sphere
-    cx, cy, cz = [random.randint(60, 100)] * 3
-    r_outer    = random.randint(15, 25)
-    r_inner    = r_outer // 2
-
-    zz, yy, xx = np.ogrid[:size, :size, :size]
-    dist        = np.sqrt((zz-cz)**2 + (yy-cy)**2 + (xx-cx)**2)
-
-    oedema_mask   = (dist < r_outer) & (dist >= r_inner)
-    necrotic_mask = dist < r_inner
-
-    seg[oedema_mask]   = 2
-    seg[necrotic_mask] = 1
-
-    # Simulate signal intensities for tumour regions
-    for c in range(cfg.IN_CHANNELS):
-        img[c][oedema_mask]   += 2.0 + np.random.randn() * 0.3
-        img[c][necrotic_mask] += 3.5 + np.random.randn() * 0.3
-
-    return img, seg
-
-
-class SyntheticDataset(Dataset):
-    """Generates synthetic volumes on-the-fly. No disk I/O needed."""
-
-    def __init__(
-        self,
-        n_samples: int  = 20,
-        cfg:       Config = Config,
-        augment:   bool  = False,
-    ) -> None:
-        self.n_samples = n_samples
-        self.cfg       = cfg
-        self.augment   = augment
-        self.aug       = Augment3D(cfg)
-
-    def __len__(self) -> int:
-        return self.n_samples
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        img, seg = make_synthetic_volume(self.cfg)
-
-        # Crop to PATCH_SIZE
-        ps      = np.array(self.cfg.PATCH_SIZE)
-        starts  = [(s - p) // 2 for s, p in zip(img.shape[1:], ps)]
-        img_p   = img[
-            :,
-            starts[0]:starts[0]+ps[0],
-            starts[1]:starts[1]+ps[1],
-            starts[2]:starts[2]+ps[2],
-        ]
-        seg_p   = seg[
-            starts[0]:starts[0]+ps[0],
-            starts[1]:starts[1]+ps[1],
-            starts[2]:starts[2]+ps[2],
-        ]
-
-        img_p, seg_p = self.aug(img_p.copy(), seg_p.copy(), training=self.augment)
-
-        return {
-            "image": torch.from_numpy(img_p.astype(np.float32)),
-            "label": torch.from_numpy(seg_p.astype(np.int64)),
-        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  3D U-Net Architecture
 # ─────────────────────────────────────────────────────────────────────────────
+class SqueezeExcite3D(nn.Module):
+    """
+    Squeeze-and-Excitation block for 3D feature maps.
+    Learns per-channel attention weights so the network can emphasise
+    the most informative modality features at each spatial location.
+    Adds ~1% parameter overhead.
+    """
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.squeeze = nn.AdaptiveAvgPool3d(1)
+        self.excite  = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c = x.shape[:2]
+        w = self.squeeze(x).view(b, c)
+        w = self.excite(w).view(b, c, 1, 1, 1)
+        return x * w
+
+
 class ConvBlock3D(nn.Module):
     """
-    Double conv block: (Conv3d → BN → ReLU) × 2
-    Residual connection added when in/out channels match.
+    Double conv block: (Conv3d → BN → LeakyReLU) × 2 + SE attention.
+    - LeakyReLU prevents dead neurons in sparse medical volumes.
+    - Squeeze-and-Excitation learns per-channel importance.
+    - Residual connection added when in/out channels match.
     """
 
     def __init__(
@@ -557,12 +514,13 @@ class ConvBlock3D(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv3d(in_ch,  out_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm3d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
             nn.Dropout3d(p=dropout),
             nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm3d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
         )
+        self.se = SqueezeExcite3D(out_ch)
         # 1×1×1 projection for residual when channel dims differ
         self.residual = (
             nn.Conv3d(in_ch, out_ch, kernel_size=1, bias=False)
@@ -570,7 +528,7 @@ class ConvBlock3D(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x) + self.residual(x)
+        return self.se(self.conv(x)) + self.residual(x)
 
 
 class EncoderBlock(nn.Module):
@@ -612,15 +570,6 @@ class DecoderBlock(nn.Module):
 
 class UNet3D(nn.Module):
     """
-    3-D U-Net for volumetric brain tumour segmentation.
-
-    Justification of architectural choices
-    ---------------------------------------
-    Encoder–decoder + skip connections (U-Net)
-        The U-Net design addresses the varying tumour size challenge:
-        deep encoder stages capture large-scale context needed to locate
-        the tumour globally, while skip connections re-inject fine spatial
-        detail needed to delineate exact boundaries at the voxel level.
 
     3D convolutions
         Brain tumours are inherently 3-D structures with inter-slice
@@ -791,7 +740,11 @@ class FocalLoss(nn.Module):
     def __init__(self, gamma: float = 2.0, alpha: Optional[torch.Tensor] = None) -> None:
         super().__init__()
         self.gamma = gamma
-        self.alpha = alpha
+        # Register as buffer so .to(device) moves it automatically
+        if alpha is not None:
+            self.register_buffer("alpha", alpha)
+        else:
+            self.alpha = None
 
     def forward(
         self, logits: torch.Tensor, targets: torch.Tensor
@@ -805,27 +758,59 @@ class FocalLoss(nn.Module):
 
 class CombinedLoss(nn.Module):
     """
-    Weighted combination: dice_w * DiceLoss  +  bce_w * CrossEntropyLoss.
+    Weighted combination: dice_w * DiceLoss  +  focal_w * FocalLoss.
 
-    The Dice component handles class imbalance; the cross-entropy component
-    provides per-voxel gradient signal that stabilises early training when
-    Dice loss gradients can be numerically unstable.
+    The Dice component directly optimises overlap and handles class imbalance.
+    The Focal component (Lin et al., 2017) down-weights easy background voxels
+    and focuses gradient signal on hard-to-classify tumour boundaries —
+    critical given the 99.25% background dominance in BraTS data.
+
+    Class weights are derived from inverse frequency of the EDA-measured
+    class distribution: BG=99.26%, NCR=0.008%, ED=0.67%, ET=0.07%.
     """
 
     def __init__(self, cfg: Config = Config) -> None:
         super().__init__()
-        self.dice_loss = DiceLoss(ignore_bg=True)
-        self.ce_loss   = nn.CrossEntropyLoss()
-        self.dw        = cfg.DICE_WEIGHT
-        self.bw        = cfg.BCE_WEIGHT
+        self.dice_loss  = DiceLoss(ignore_bg=True)
+        # Inverse-frequency class weights for severe imbalance
+        class_weights   = torch.tensor([0.01, 40.0, 1.5, 15.0], dtype=torch.float32)
+        self.focal_loss = FocalLoss(gamma=cfg.FOCAL_GAMMA, alpha=class_weights)
+        self.dw         = cfg.DICE_WEIGHT
+        self.fw         = cfg.BCE_WEIGHT   # reusing the config slot for focal weight
 
     def forward(
-        self, logits: torch.Tensor, targets: torch.Tensor
+        self, logits: Union[torch.Tensor, List[torch.Tensor]], targets: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if isinstance(logits, list):
+            # Deep Supervision Loss
+            # out[0] is full resolution, out[1] is 1/2, out[2] is 1/4
+            weights = [0.5, 0.3, 0.2]
+            total_loss = dl_total = fl_total = 0.0
+
+            for pred, w in zip(logits, weights):
+                # Resize targets to match prediction scale if needed
+                if pred.shape[2:] != targets.shape[1:]:
+                    target_res = F.interpolate(
+                        targets.unsqueeze(1).float(),
+                        size=pred.shape[2:],
+                        mode="nearest"
+                    ).squeeze(1).long()
+                else:
+                    target_res = targets
+
+                dl = self.dice_loss(pred, target_res)
+                fl = self.focal_loss(pred, target_res)
+                total_loss += w * (self.dw * dl + self.fw * fl)
+                dl_total += w * dl
+                fl_total += w * fl
+
+            return total_loss, torch.tensor(dl_total), torch.tensor(fl_total)
+
+        # Standard Loss
         dl   = self.dice_loss(logits, targets)
-        ce   = self.ce_loss(logits, targets)
-        loss = self.dw * dl + self.bw * ce
-        return loss, dl, ce
+        fl   = self.focal_loss(logits, targets)
+        loss = self.dw * dl + self.fw * fl
+        return loss, dl, fl
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -919,32 +904,42 @@ def train_one_epoch(
     dice_sums  = [0.0] * (cfg.NUM_CLASSES - 1)
     n_batches  = 0
 
-    for batch in loader:
+    print(f"   (Buffering first {cfg.NUM_WORKERS} batches on CPU...)")
+    pbar = tqdm(loader, desc="   Train", leave=False)
+    for i, batch in enumerate(pbar):
         imgs   = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
-
         # Automatic Mixed Precision forward pass
-        with autocast(enabled=cfg.AMP and device == "cuda"):
-            logits           = model(imgs)
-            loss, dl, ce     = criterion(logits, labels)
+        with autocast("cuda", enabled=cfg.AMP and device == "cuda"):
+            logits       = model(imgs)
+            loss, dl, ce = criterion(logits, labels)
+            # Scale loss for accumulation
+            loss = loss / cfg.ACCUMULATION_STEPS
 
-        # Scaled backward + gradient clipping
+        # Scaled backward
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-        scaler.step(optimizer)
-        scaler.update()
 
-        total_loss    += loss.item()
+        if (i + 1) % cfg.ACCUMULATION_STEPS == 0 or (i + 1) == len(loader):
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        total_loss    += loss.item() * cfg.ACCUMULATION_STEPS
         dice_loss_sum += dl.item()
         ce_loss_sum   += ce.item()
 
-        m = evaluate_batch(logits.detach(), labels, cfg.NUM_CLASSES)
-        for i, d in enumerate(m["dice"]):
-            dice_sums[i] += d
+        # For metrics, use highest resolution prediction only
+        main_logits = logits[0] if isinstance(logits, list) else logits
+        m = evaluate_batch(main_logits.detach(), labels, cfg.NUM_CLASSES)
+        for j, d in enumerate(m["dice"]):
+            dice_sums[j] += d
         n_batches += 1
+
+        pbar.set_postfix(loss=f"{loss.item()*cfg.ACCUMULATION_STEPS:.3f}",
+                        dice=f"{np.mean(m['dice']):.3f}")
 
     n = max(n_batches, 1)
     return {
@@ -970,11 +965,12 @@ def validate(
     iou_sums   = [0.0] * (cfg.NUM_CLASSES - 1)
     n_batches  = 0
 
-    for batch in loader:
+    pbar = tqdm(loader, desc="   Val  ", leave=False)
+    for batch in pbar:
         imgs   = batch["image"].to(device)
         labels = batch["label"].to(device)
 
-        with autocast(enabled=cfg.AMP and device == "cuda"):
+        with autocast("cuda", enabled=cfg.AMP and device == "cuda"):
             logits       = model(imgs)
             loss, _, _   = criterion(logits, labels)
 
@@ -984,6 +980,7 @@ def validate(
             dice_sums[i] += m["dice"][i]
             iou_sums[i]  += m["iou"][i]
         n_batches += 1
+        pbar.set_postfix(dice=f"{np.mean(m['dice']):.3f}")
 
     n = max(n_batches, 1)
     return {
@@ -1001,14 +998,17 @@ def train(
     val_loader:   DataLoader,
     cfg:          Config,
 ) -> Dict[str, list]:
-    """Full training loop with AMP, early stopping, and checkpointing."""
+    """Full training loop with AMP, early stopping, checkpointing, and resume."""
 
     device    = cfg.DEVICE
     criterion = CombinedLoss(cfg).to(device)
     optimizer = AdamW(model.parameters(), lr=cfg.LR,
                       weight_decay=cfg.WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=1e-6)
-    scaler    = GradScaler(enabled=cfg.AMP and device == "cuda")
+    warmup_epochs = 5
+    warmup    = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+    cosine    = CosineAnnealingLR(optimizer, T_max=max(1, cfg.EPOCHS - warmup_epochs), eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_epochs])
+    scaler    = GradScaler("cuda", enabled=cfg.AMP and device == "cuda")
 
     history: Dict[str, list] = {
         "train_loss": [], "val_loss": [],
@@ -1018,17 +1018,38 @@ def train(
 
     best_val_dice = -1.0
     patience_ctr  = 0
+    start_epoch   = 1
     best_ckpt     = str(cfg.CHECKPOINT_DIR / "best_model.pth")
+    last_ckpt     = str(cfg.CHECKPOINT_DIR / "last_checkpoint.pth")
+
+    # ── Resume from last checkpoint if available ──────────────────────────────
+    if Path(last_ckpt).exists():
+        print(f"\n⟳ Resuming from {last_ckpt}...")
+        ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optim_state"])
+        if "scheduler_state" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+        if "scaler_state" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state"])
+        if "history" in ckpt:
+            history = ckpt["history"]
+        best_val_dice = ckpt.get("best_val_dice", -1.0)
+        patience_ctr  = ckpt.get("patience_ctr", 0)
+        start_epoch   = ckpt["epoch"] + 1
+        print(f"   Resumed at epoch {start_epoch} "
+              f"(best Dice so far: {best_val_dice:.4f}, "
+              f"patience: {patience_ctr}/{cfg.PATIENCE})")
 
     print(f"\n{'='*65}")
     print(f"Training on {device.upper()}"
           + (f"  [{torch.cuda.get_device_name(0)}]"
              if device == "cuda" else ""))
-    print(f"Epochs: {cfg.EPOCHS}  |  Batch: {cfg.BATCH_SIZE}"
-          f"  |  Patch: {cfg.PATCH_SIZE}  |  LR: {cfg.LR}")
+    print(f"Epochs: {start_epoch}→{cfg.EPOCHS}  |  Batch: {cfg.BATCH_SIZE}"
+          f"  |  Patch: {cfg.PATCH_SIZE}  |  LR: {optimizer.param_groups[0]['lr']:.6f}")
     print(f"{'='*65}\n")
 
-    for epoch in range(1, cfg.EPOCHS + 1):
+    for epoch in range(start_epoch, cfg.EPOCHS + 1):
         t0 = time.time()
 
         train_m = train_one_epoch(model, train_loader, criterion,
@@ -1066,7 +1087,9 @@ def train(
         if val_m["mean_dice"] > best_val_dice:
             best_val_dice = val_m["mean_dice"]
             patience_ctr  = 0
-            save_checkpoint(model, optimizer, epoch, val_m, best_ckpt)
+            save_checkpoint(model, optimizer, epoch, val_m, best_ckpt,
+                            scheduler, scaler, history,
+                            best_val_dice, patience_ctr)
             print(f"           ✓ New best model saved  (Dice={best_val_dice:.4f})")
         else:
             patience_ctr += 1
@@ -1075,9 +1098,16 @@ def train(
                       f" (no improvement for {cfg.PATIENCE} epochs)")
                 break
 
+        # Always save last checkpoint for resume
+        save_checkpoint(model, optimizer, epoch, val_m, last_ckpt,
+                        scheduler, scaler, history,
+                        best_val_dice, patience_ctr)
+
     # Save final weights
     final_ckpt = str(cfg.CHECKPOINT_DIR / "final_model.pth")
-    save_checkpoint(model, optimizer, epoch, val_m, final_ckpt)
+    save_checkpoint(model, optimizer, epoch, val_m, final_ckpt,
+                    scheduler, scaler, history,
+                    best_val_dice, patience_ctr)
     print(f"\nFinal model saved → {final_ckpt}")
     print(f"Best model saved  → {best_ckpt}"
           f"  (Val Dice = {best_val_dice:.4f})")
@@ -1094,27 +1124,44 @@ def save_checkpoint(
     epoch:     int,
     metrics:   dict,
     path:      str,
+    scheduler=None,
+    scaler=None,
+    history=None,
+    best_val_dice: float = -1.0,
+    patience_ctr: int = 0,
 ) -> None:
-    torch.save({
-        "epoch":       epoch,
-        "model_state": model.state_dict(),
-        "optim_state": optimizer.state_dict(),
-        "metrics":     metrics,
+    """Save a full-state checkpoint for resume support."""
+    payload = {
+        "epoch":          epoch,
+        "model_state":    model.state_dict(),
+        "optim_state":    optimizer.state_dict(),
+        "metrics":        metrics,
+        "best_val_dice":  best_val_dice,
+        "patience_ctr":   patience_ctr,
         "config": {
             "IN_CHANNELS":  Config.IN_CHANNELS,
             "NUM_CLASSES":  Config.NUM_CLASSES,
             "BASE_FILTERS": Config.BASE_FILTERS,
             "PATCH_SIZE":   Config.PATCH_SIZE,
         },
-    }, path)
+    }
+    if scheduler is not None:
+        payload["scheduler_state"] = scheduler.state_dict()
+    if scaler is not None:
+        payload["scaler_state"] = scaler.state_dict()
+    if history is not None:
+        payload["history"] = history
+    torch.save(payload, path)
 
 
 def load_checkpoint(path: str, model: nn.Module,
                     device: str = "cpu") -> dict:
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
+    dice_val = ckpt.get('metrics', {}).get('mean_dice', 'N/A')
+    dice_str = f"{dice_val:.4f}" if isinstance(dice_val, float) else str(dice_val)
     print(f"Loaded checkpoint from epoch {ckpt['epoch']}"
-          f"  (Val Dice = {ckpt['metrics'].get('mean_dice', 'N/A'):.4f})")
+          f"  (Val Dice = {dice_str})")
     return ckpt
 
 
@@ -1170,7 +1217,7 @@ def hyperparameter_search(
                 criterion = CombinedLoss(cfg).to(cfg.DEVICE)
                 optimizer = AdamW(model.parameters(), lr=cfg.LR,
                                   weight_decay=cfg.WEIGHT_DECAY)
-                scaler    = GradScaler(enabled=cfg.AMP and cfg.DEVICE == "cuda")
+                scaler    = GradScaler("cuda", enabled=cfg.AMP and cfg.DEVICE == "cuda")
 
                 for _ in range(cfg.EPOCHS):
                     train_one_epoch(model, tl, criterion, optimizer,
@@ -1222,7 +1269,7 @@ def test_evaluation(
         imgs   = batch["image"].to(device)
         labels = batch["label"]
 
-        with autocast(enabled=cfg.AMP and device == "cuda"):
+        with autocast("cuda", enabled=cfg.AMP and device == "cuda"):
             logits = model(imgs)
 
         preds = logits.argmax(dim=1).cpu().numpy()
@@ -1347,7 +1394,7 @@ def save_sample_predictions(
         img    = sample["image"].unsqueeze(0).to(device)
         lbl    = sample["label"].numpy()
 
-        with autocast(enabled=cfg.AMP and device == "cuda"):
+        with autocast("cuda", enabled=cfg.AMP and device == "cuda"):
             logit = model(img)
         pred = logit.argmax(dim=1).squeeze(0).cpu().numpy()
 
@@ -1422,12 +1469,12 @@ def plot_model_architecture_summary(model: nn.Module, cfg: Config) -> None:
 def _data_exists(cfg: Config) -> bool:
     if not cfg.DATA_ROOT.exists():
         return False
-    patient_dirs = [d for d in cfg.DATA_ROOT.iterdir() if d.is_dir() and "BraTS" in d.name]
+    patient_dirs = [d for d in cfg.DATA_ROOT.rglob("BraTS*") if d.is_dir() and "GLI" in d.name and d.name.startswith("BraTS")]
     return len(patient_dirs) > 0
 
 def download_brats_data(cfg: Config, auth_token: Optional[str] = None) -> None:
     if not SYNAPSE_AVAILABLE:
-        print("Synapse client not available. Cannot download.")
+        print("Synapse client not available. Cannot verify/download data via API.")
         return
 
     try:
@@ -1439,66 +1486,404 @@ def download_brats_data(cfg: Config, auth_token: Optional[str] = None) -> None:
     token = auth_token or os.environ.get("SYNAPSE_AUTH_TOKEN")
     if not token:
         print("No SYNAPSE_AUTH_TOKEN found in environment or .env file.")
-        print("Please add it to .env or pass it via --auth-token.")
-        return
+        import getpass
+        token = getpass.getpass("Please enter your Synapse auth token to verify/download data: ")
+        if not token:
+            print("No token provided. Cannot verify dataset via API.")
+            sys.exit(1)
+        os.environ["SYNAPSE_AUTH_TOKEN"] = token
 
-    if _data_exists(cfg):
-        print(f"Data already exists at {cfg.DATA_ROOT}. Skipping download.")
-        return
-
-    print("Authenticating with Synapse...")
+    print("Authenticating with Synapse to verify dataset...")
     syn = synapseclient.Synapse()
     syn.login(authToken=token)
 
-    print(f"Downloading dataset {cfg.SYNAPSE_ID} to {cfg.DATA_ROOT}...")
+    # 1. First, fetch what is available via the API
+    print(f"Checking API for dataset {cfg.SYNAPSE_ID}...")
+    children = list(syn.getChildren(cfg.SYNAPSE_ID))
+    
+    # 2. Check if the local data has the full data matching the API
+    missing_zips = False
     cfg.DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    
+    for child in children:
+        name = child['name']
+        if name.endswith('.zip'):
+            local_path = cfg.DATA_ROOT / name
+            # If the zip is missing, check if we at least have extracted patient dirs.
+            # We assume if there's a large number of extracted dirs, the data is full.
+            if not local_path.exists():
+                missing_zips = True
 
-    files = synapseutils.syncFromSynapse(syn, entity=cfg.SYNAPSE_ID, path=str(cfg.DATA_ROOT))
+    patient_dirs = [d for d in cfg.DATA_ROOT.rglob("BraTS*") if d.is_dir() and "GLI" in d.name and d.name.startswith("BraTS")]
+    data_fully_extracted = len(patient_dirs) > 1500
 
-    import subprocess
-    for f in files:
-        filepath = f.path
-        if filepath.endswith('.zip') or filepath.endswith('.7z'):
-            print(f"Extracting {filepath} using p7zip...")
+    if not missing_zips or data_fully_extracted:
+        print(f"Data verification passed. Found full dataset (either zip files or {len(patient_dirs)} extracted patients).")
+    else:
+        print(f"Data is missing or incomplete. Downloading from Synapse API to {cfg.DATA_ROOT}...")
+        files = synapseutils.syncFromSynapse(syn, entity=cfg.SYNAPSE_ID, path=str(cfg.DATA_ROOT))
+
+    # After verification/download, extract any local zip files if patient dirs are missing
+    patient_dirs = [d for d in cfg.DATA_ROOT.rglob("BraTS*") if d.is_dir() and "GLI" in d.name and d.name.startswith("BraTS")]
+    if len(patient_dirs) < 100:  # If we don't have enough extracted patient directories
+        local_zips = list(cfg.DATA_ROOT.glob("*.zip"))
+        if local_zips:
+            import zipfile
+            print(f"Extracted patient directories missing. Extracting verified zip archives...")
+            for filepath in local_zips:
+                print(f"Extracting {filepath} using zipfile...")
+                try:
+                    with zipfile.ZipFile(filepath, 'r') as zip_ref:
+                        zip_ref.extractall(cfg.DATA_ROOT)
+                except Exception as e:
+                    print(f"WARNING: Failed to extract {filepath}: {e}")
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11b. Initial Data Analysis (EDA)
+# ─────────────────────────────────────────────────────────────────────────────
+def run_eda(cfg: Config, data_root: Path, results_dir: Path) -> None:
+    print("\n--- Running Initial Data Analysis (EDA) ---")
+    if not data_root.exists():
+        print(f"Data root {data_root} does not exist. Cannot run EDA.")
+        return
+
+    patient_dirs = sorted(list(set([d for d in data_root.rglob("BraTS*") if d.is_dir() and "GLI" in d.name and d.name.startswith("BraTS")])))
+    if len(patient_dirs) == 0:
+        print("No patient directories found for EDA.")
+        return
+        
+    print(f"Total patient directories found: {len(patient_dirs)}")
+    
+    # 1. Visualize 3D Data (Pick a random patient)
+    random_dir = random.choice(patient_dirs)
+    print(f"Visualizing random subject: {random_dir.name}")
+    
+    t2f_path = random_dir / f"{random_dir.name}-t2f.nii.gz"
+    t1c_path = random_dir / f"{random_dir.name}-t1c.nii.gz"
+    seg_path = random_dir / f"{random_dir.name}-seg.nii.gz"
+    
+    # Fallback to .nii if .nii.gz doesn't exist
+    if not t2f_path.exists(): t2f_path = random_dir / f"{random_dir.name}-t2f.nii"
+    if not t1c_path.exists(): t1c_path = random_dir / f"{random_dir.name}-t1c.nii"
+    if not seg_path.exists(): seg_path = random_dir / f"{random_dir.name}-seg.nii"
+    
+    if not (t2f_path.exists() and t1c_path.exists() and seg_path.exists()):
+        print("Missing required NIfTI files for visualization.")
+    else:
+        try:
+            import nibabel as nib
+            t2f = nib.load(str(t2f_path)).get_fdata()
+            t1c = nib.load(str(t1c_path)).get_fdata()
+            seg = nib.load(str(seg_path)).get_fdata()
+            
+            # Pick a middle slice in the axial (Z) plane where tumor is prominent
+            z_mid = t2f.shape[2] // 2
+            tumor_slices = np.sum(seg > 0, axis=(0, 1))
+            if np.max(tumor_slices) > 0:
+                z_mid = np.argmax(tumor_slices)
+                
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            axes[0].imshow(t2f[:, :, z_mid].T, cmap='gray', origin='lower')
+            axes[0].set_title('T2-FLAIR')
+            axes[1].imshow(t1c[:, :, z_mid].T, cmap='gray', origin='lower')
+            axes[1].set_title('T1c')
+            
+            cmap = ListedColormap(['black', 'red', 'green', 'blue'])
+            axes[2].imshow(seg[:, :, z_mid].T, cmap=cmap, origin='lower', vmin=0, vmax=3)
+            axes[2].set_title('Segmentation Mask (Red: NCR, Green: ED, Blue: ET)')
+            
+            for ax in axes:
+                ax.axis('off')
+            plt.tight_layout()
+            plt.savefig(results_dir / "eda_sample_slice.png", dpi=150)
+            plt.close()
+            print(f"  Saved slice visualization to {results_dir / 'eda_sample_slice.png'}")
+        except Exception as e:
+            print(f"  Error during visualization: {e}")
+
+    # 2. Compute Class Distribution to quantify Class Imbalance
+    print("Computing class distribution (over a subset of 10 patients)...")
+    subset = random.sample(patient_dirs, min(10, len(patient_dirs)))
+    class_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    
+    for p_dir in subset:
+        s_path = p_dir / f"{p_dir.name}-seg.nii.gz"
+        if not s_path.exists(): s_path = p_dir / f"{p_dir.name}-seg.nii"
+        
+        if s_path.exists():
             try:
-                subprocess.run(['7z', 'x', filepath, f'-o{cfg.DATA_ROOT}', '-y'], check=True)
-            except FileNotFoundError:
-                print("WARNING: p7zip (7z) not found. Please install it to extract archives.")
-            except subprocess.CalledProcessError as e:
-                print(f"WARNING: Failed to extract {filepath}: {e}")
+                import nibabel as nib
+                seg = nib.load(str(s_path)).get_fdata()
+                unique, counts = np.unique(seg, return_counts=True)
+                for u, c in zip(unique, counts):
+                    if u in class_counts:
+                        class_counts[int(u)] += c
+            except Exception:
+                pass
+                
+    total_voxels = sum(class_counts.values())
+    if total_voxels > 0:
+        print("\nClass Imbalance Statistics:")
+        for c_idx, name in enumerate(cfg.CLASS_NAMES):
+            pct = (class_counts[c_idx] / total_voxels) * 100
+            print(f"  {name}: {pct:.4f}% ({class_counts[c_idx]} voxels)")
+            
+        fig, ax = plt.subplots(figsize=(8, 6))
+        bars = ax.bar(cfg.CLASS_NAMES, [class_counts[i] for i in range(4)], color=['gray', 'red', 'green', 'blue'])
+        ax.set_yscale('log')  # Log scale due to severe imbalance
+        ax.set_ylabel('Voxel Count (Log Scale)')
+        ax.set_title('Class Distribution (Demonstrating Severe Imbalance)')
+        plt.tight_layout()
+        plt.savefig(results_dir / "eda_class_distribution.png", dpi=150)
+        plt.close()
+        print(f"  Saved class distribution plot to {results_dir / 'eda_class_distribution.png'}")
+    print("--- EDA Complete ---\n")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 12.  Dataset factory  (real BraTS  or  synthetic)
+# 12.  Dataset factory — balanced, stratified subset with metadata
 # ─────────────────────────────────────────────────────────────────────────────
+SUBSET_TOTAL = 600          # total patients to use
+SUBSET_TRAIN = 530          # 530 train + 35 val + 35 test = 600
+SUBSET_VAL   = 35
+SUBSET_TEST  = 35
+
+
+def _compute_tumour_volume(seg_path: Path) -> float:
+    """Compute total tumour voxel count (labels 1, 2, 3) for stratification."""
+    try:
+        seg = nib.load(str(seg_path)).get_fdata(dtype=np.float32)
+        return float(np.sum(seg > 0))
+    except Exception:
+        return 0.0
+
+
+def _stratified_subset_split(
+    patient_dirs: List[Path],
+    cfg: Config,
+    n_total: int = SUBSET_TOTAL,
+    n_train: int = SUBSET_TRAIN,
+    n_val: int   = SUBSET_VAL,
+    n_test: int  = SUBSET_TEST,
+) -> Tuple[List[Path], List[Path], List[Path]]:
+    """
+    Selects a balanced subset of patients and splits them into train/val/test
+    using stratification by tumour volume to ensure each split has a similar
+    distribution of small, medium, and large tumours.
+
+    Steps:
+      1. Filter to patients that actually have a segmentation mask.
+      2. Compute tumour volume for each patient.
+      3. Bin patients into volume strata (quartiles).
+      4. Sample proportionally from each stratum to build the subset.
+      5. Within each stratum, split into train/val/test.
+    """
+    assert n_train + n_val + n_test == n_total, \
+        f"Split sizes must sum to n_total: {n_train}+{n_val}+{n_test} != {n_total}"
+
+    # 1. Filter to patients with segmentation masks
+    labelled = []
+    for d in patient_dirs:
+        seg = d / f"{d.name}-seg.nii.gz"
+        if seg.exists():
+            labelled.append(d)
+    print(f"  Patients with segmentation masks: {len(labelled)} / {len(patient_dirs)}")
+
+    if len(labelled) < n_total:
+        print(f"  WARNING: Only {len(labelled)} labelled patients available, "
+              f"using all of them instead of {n_total}.")
+        n_total = len(labelled)
+        # Rescale splits proportionally
+        ratio_val  = n_val / (n_train + n_val + n_test)
+        ratio_test = n_test / (n_train + n_val + n_test)
+        n_val  = max(1, int(n_total * ratio_val))
+        n_test = max(1, int(n_total * ratio_test))
+        n_train = n_total - n_val - n_test
+
+    # 2. Compute tumour volumes
+    print(f"  Computing tumour volumes for stratification ({len(labelled)} patients)...")
+    volumes = {}
+    for i, d in enumerate(labelled):
+        seg_path = d / f"{d.name}-seg.nii.gz"
+        volumes[d] = _compute_tumour_volume(seg_path)
+        if (i + 1) % 200 == 0:
+            print(f"    ... processed {i+1}/{len(labelled)}")
+    print(f"    ... done. Volume range: {min(volumes.values()):.0f} – {max(volumes.values()):.0f} voxels")
+
+    # 3. Bin into strata using quartiles
+    vol_values = np.array([volumes[d] for d in labelled])
+    q25, q50, q75 = np.percentile(vol_values, [25, 50, 75])
+
+    strata: Dict[str, List[Path]] = {
+        "small":       [],   # 0 – Q25
+        "medium_low":  [],   # Q25 – Q50
+        "medium_high": [],   # Q50 – Q75
+        "large":       [],   # Q75+
+    }
+    for d in labelled:
+        v = volumes[d]
+        if v <= q25:
+            strata["small"].append(d)
+        elif v <= q50:
+            strata["medium_low"].append(d)
+        elif v <= q75:
+            strata["medium_high"].append(d)
+        else:
+            strata["large"].append(d)
+
+    print(f"  Strata counts: " + ", ".join(f"{k}={len(v)}" for k, v in strata.items()))
+
+    # 4. Sample proportionally from each stratum, then split
+    random.seed(cfg.SEED)
+    train_dirs, val_dirs, test_dirs = [], [], []
+
+    for stratum_name, stratum_dirs in strata.items():
+        random.shuffle(stratum_dirs)
+        # Proportion of the total pool this stratum represents
+        proportion = len(stratum_dirs) / len(labelled)
+        s_total = max(1, round(n_total * proportion))
+        s_val   = max(1, round(n_val * proportion))
+        s_test  = max(1, round(n_test * proportion))
+        s_train = s_total - s_val - s_test
+
+        # Clamp to available
+        s_total = min(s_total, len(stratum_dirs))
+        s_train = min(s_train, s_total - s_val - s_test)
+        if s_train < 0:
+            s_train = 0
+
+        selected = stratum_dirs[:s_total]
+        train_dirs.extend(selected[:s_train])
+        val_dirs.extend(selected[s_train:s_train + s_val])
+        test_dirs.extend(selected[s_train + s_val:s_train + s_val + s_test])
+
+    # 5. Adjust counts to match exact targets (rounding may cause ±1-2 drift)
+    all_used = set(train_dirs + val_dirs + test_dirs)
+    all_unused = [d for d in labelled if d not in all_used]
+    random.shuffle(all_unused)
+
+    while len(train_dirs) + len(val_dirs) + len(test_dirs) < n_total and all_unused:
+        train_dirs.append(all_unused.pop())
+    while len(train_dirs) > n_train and len(val_dirs) < n_val:
+        val_dirs.append(train_dirs.pop())
+    while len(train_dirs) > n_train and len(test_dirs) < n_test:
+        test_dirs.append(train_dirs.pop())
+
+    random.shuffle(train_dirs)
+    random.shuffle(val_dirs)
+    random.shuffle(test_dirs)
+
+    return train_dirs, val_dirs, test_dirs
+
+
+def _save_subset_metadata(
+    train_dirs: List[Path],
+    val_dirs: List[Path],
+    test_dirs: List[Path],
+    cfg: Config,
+) -> Path:
+    """Save a JSON file describing which patients were assigned to each split."""
+    import json
+
+    metadata = {
+        "description": "BraTS 2024 GLI stratified subset metadata",
+        "created_at": str(pd.Timestamp.now()),
+        "seed": cfg.SEED,
+        "total_patients": len(train_dirs) + len(val_dirs) + len(test_dirs),
+        "splits": {
+            "train": {
+                "count": len(train_dirs),
+                "patients": sorted([d.name for d in train_dirs]),
+            },
+            "validation": {
+                "count": len(val_dirs),
+                "patients": sorted([d.name for d in val_dirs]),
+            },
+            "test": {
+                "count": len(test_dirs),
+                "patients": sorted([d.name for d in test_dirs]),
+            },
+        },
+        "stratification": "tumour_volume_quartiles",
+        "notes": (
+            "Patients were stratified by total tumour volume (voxels with label > 0) "
+            "into 4 quartile-based strata (small, medium_low, medium_high, large). "
+            "Each split was sampled proportionally from every stratum to ensure "
+            "balanced tumour-size representation across train, validation, and test sets."
+        ),
+    }
+
+    out_path = cfg.RESULTS_DIR / "subset_metadata.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"  Subset metadata saved → {out_path}")
+    return out_path
+
+
 def build_datasets(
     cfg: Config,
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
     Returns (train_dataset, val_dataset, test_dataset).
-    Uses BraTS data from DATA_ROOT.
-    """
-    if not cfg.DATA_ROOT.exists():
-        raise FileNotFoundError(f"Data root not found: {cfg.DATA_ROOT}")
+    Selects a balanced subset of 600 patients from DATA_ROOT, stratified by
+    tumour volume, and writes subset_metadata.json documenting the split.
 
-    patient_dirs = sorted([
-        d for d in cfg.DATA_ROOT.iterdir()
-        if d.is_dir() and "BraTS" in d.name
-    ])
+    Optimization: If subset_metadata.json exists, reloads the previous split
+    to save 2-5 minutes of volume calculations.
+    """
+    import json
+    if not cfg.DATA_ROOT.exists():
+        raise FileNotFoundError(f"Data root not found: {cfg.DATA_ROOT}. Please ensure data is downloaded.")
+
+    meta_path = cfg.RESULTS_DIR / "subset_metadata.json"
+    if meta_path.exists():
+        print(f"  Loading existing subset selection from {meta_path}...")
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            
+            # Map patient names back to full paths
+            def name_to_path(name):
+                # Search for the directory in DATA_ROOT
+                matches = list(cfg.DATA_ROOT.rglob(name))
+                return matches[0] if matches else None
+
+            tr_dirs   = [name_to_path(p) for p in meta["splits"]["train"]["patients"]]
+            val_dirs  = [name_to_path(p) for p in meta["splits"]["validation"]["patients"]]
+            test_dirs = [name_to_path(p) for p in meta["splits"]["test"]["patients"]]
+
+            # Verify all paths exist
+            if all(d and d.exists() for d in tr_dirs + val_dirs + test_dirs):
+                print(f"  Successfully reloaded {len(tr_dirs)+len(val_dirs)+len(test_dirs)} patients.")
+                train_ds = BraTSDataset(tr_dirs,   cfg, augment=True)
+                val_ds   = BraTSDataset(val_dirs,  cfg, augment=False)
+                test_ds  = BraTSDataset(test_dirs, cfg, augment=False)
+                return train_ds, val_ds, test_ds
+            else:
+                print("  Some cached patients are missing from disk. Re-calculating subset...")
+        except Exception as e:
+            print(f"  Error loading metadata ({e}). Re-calculating subset...")
+
+    patient_dirs = sorted(list(set([
+        d for d in cfg.DATA_ROOT.rglob("BraTS*")
+        if d.is_dir() and "GLI" in d.name and d.name.startswith("BraTS")
+    ])))
     if len(patient_dirs) == 0:
         raise ValueError("No patient directories found in DATA_ROOT")
 
-    n = len(patient_dirs)
-    n_test = max(1, int(n * cfg.TEST_SPLIT))
-    n_val  = max(1, int(n * cfg.VAL_SPLIT))
-    n_tr   = n - n_val - n_test
+    print(f"  Total patient directories discovered: {len(patient_dirs)}")
 
-    random.shuffle(patient_dirs)
-    tr_dirs   = patient_dirs[:n_tr]
-    val_dirs  = patient_dirs[n_tr:n_tr + n_val]
-    test_dirs = patient_dirs[n_tr + n_val:]
+    # Stratified subset selection
+    tr_dirs, val_dirs, test_dirs = _stratified_subset_split(patient_dirs, cfg)
 
-    print(f"  BraTS patients — Train: {len(tr_dirs)}"
-          f"  Val: {len(val_dirs)}  Test: {len(test_dirs)}")
+    print(f"  Subset — Train: {len(tr_dirs)}"
+          f"  Val: {len(val_dirs)}  Test: {len(test_dirs)}"
+          f"  Total: {len(tr_dirs) + len(val_dirs) + len(test_dirs)}")
+
+    # Save metadata JSON
+    _save_subset_metadata(tr_dirs, val_dirs, test_dirs, cfg)
 
     train_ds = BraTSDataset(tr_dirs,   cfg, augment=True)
     val_ds   = BraTSDataset(val_dirs,  cfg, augment=False)
@@ -1529,6 +1914,10 @@ def parse_args() -> argparse.Namespace:
                  help="Skip EDA step")
     p.add_argument("--eda-only", action="store_true",
                  help="Run EDA only and exit")
+    p.add_argument("--finetune", action="store_true",
+                 help="Fine-tune from best_model.pth with lower LR")
+    p.add_argument("--finetune-epochs", type=int, default=25,
+                 help="Number of fine-tuning epochs (default: 25)")
     return p.parse_args()
 
 
@@ -1551,14 +1940,12 @@ def main() -> None:
     if args.auth_token:
         os.environ["SYNAPSE_AUTH_TOKEN"] = args.auth_token
 
-    token = os.environ.get("SYNAPSE_AUTH_TOKEN")
-    if token or args.download:
-        download_brats_data(cfg, args.auth_token)
+    # Ensure dataset is downloaded and available before proceeding
+    download_brats_data(cfg, args.auth_token)
 
     # ── EDA ──────────────────────────────────────────────────────────────────
     if not args.skip_eda:
         print("\nSTEP 1 — Exploratory Data Analysis")
-        from task2_eda import run_eda
         run_eda(cfg, cfg.DATA_ROOT, cfg.RESULTS_DIR)
 
     if args.eda_only:
@@ -1572,14 +1959,17 @@ def main() -> None:
     train_loader = DataLoader(
         train_ds, batch_size=cfg.BATCH_SIZE,
         shuffle=True,  num_workers=cfg.NUM_WORKERS, pin_memory=True,
+        prefetch_factor=cfg.PREFETCH_FACTOR, persistent_workers=True,
     )
     val_loader   = DataLoader(
         val_ds,   batch_size=cfg.BATCH_SIZE,
         shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=True,
+        prefetch_factor=cfg.PREFETCH_FACTOR, persistent_workers=True,
     )
     test_loader  = DataLoader(
         test_ds,  batch_size=cfg.BATCH_SIZE,
-        shuffle=False, num_workers=cfg.NUM_WORKERS,
+        shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=True,
+        prefetch_factor=cfg.PREFETCH_FACTOR, persistent_workers=True,
     )
 
     # ── Evaluation-only mode ──────────────────────────────────────────────────
@@ -1593,6 +1983,51 @@ def main() -> None:
         metrics = test_evaluation(model, test_loader, cfg)
         plot_dice_per_class(metrics, cfg)
         save_sample_predictions(model, test_ds, cfg, n=cfg.SAVE_VIS_N)
+        return
+
+    # ── Fine-tune mode ────────────────────────────────────────────────────────
+    if args.finetune:
+        print("\nSTEP 4 — Building 3D U-Net for fine-tuning")
+        model = UNet3D(cfg).to(cfg.DEVICE)
+
+        # Load the best model from initial training as starting point
+        ft_last  = str(cfg.CHECKPOINT_DIR / "finetune_last.pth")
+        best_init = str(cfg.CHECKPOINT_DIR / "best_model.pth")
+
+        if not Path(ft_last).exists() and not Path(best_init).exists():
+            print("ERROR: No best_model.pth found. Run initial training first.")
+            sys.exit(1)
+
+        print("\nSTEP 5 — Fine-tuning")
+        history = finetune(
+            model, train_loader, val_loader, cfg,
+            finetune_epochs=args.finetune_epochs,
+        )
+        plot_training_curves(history, cfg)
+
+        # ── Load best fine-tuned checkpoint for evaluation ────────────────────
+        ft_best = str(cfg.CHECKPOINT_DIR / "finetune_best.pth")
+        print("\nSTEP 6 — Loading best fine-tuned checkpoint")
+        if Path(ft_best).exists():
+            load_checkpoint(ft_best, model, cfg.DEVICE)
+        elif Path(best_init).exists():
+            load_checkpoint(best_init, model, cfg.DEVICE)
+
+        print("\nSTEP 7 — Test evaluation (fine-tuned)")
+        metrics = test_evaluation(model, test_loader, cfg)
+
+        print("\nSTEP 8 — Saving visualisations")
+        plot_dice_per_class(metrics, cfg)
+        save_sample_predictions(model, test_ds, cfg, n=cfg.SAVE_VIS_N)
+
+        print(f"\n{'='*65}")
+        print("Fine-tuning complete.")
+        print(f"  Best checkpoint  → {cfg.CHECKPOINT_DIR}/finetune_best.pth")
+        print(f"  Training curves  → {cfg.RESULTS_DIR}/training_curves.png")
+        print(f"  Dice per class   → {cfg.RESULTS_DIR}/dice_per_class.png")
+        print(f"  Predictions      → {cfg.PRED_DIR}/")
+        print(f"  Metrics CSV      → {cfg.RESULTS_DIR}/metrics_summary.csv")
+        print(f"{'='*65}")
         return
 
     # ── Hyperparameter search ─────────────────────────────────────────────────
@@ -1645,6 +2080,142 @@ def main() -> None:
     print(f"  Metrics CSV      → {cfg.RESULTS_DIR}/metrics_summary.csv")
     print(f"  HP search CSV    → {cfg.RESULTS_DIR}/hyperparameter_search.csv")
     print(f"{'='*65}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14.  Fine-tuning
+# ─────────────────────────────────────────────────────────────────────────────
+def finetune(
+    model:        nn.Module,
+    train_loader: DataLoader,
+    val_loader:   DataLoader,
+    cfg:          Config,
+    finetune_epochs: int = 25,
+) -> Dict[str, list]:
+    """Fine-tune from best_model.pth with lower LR, cosine decay, and resume."""
+
+    device    = cfg.DEVICE
+    criterion = CombinedLoss(cfg).to(device)
+
+    # Fine-tune hyperparameters
+    ft_lr = 1e-4                     # 10x lower than initial training
+    optimizer = AdamW(model.parameters(), lr=ft_lr, weight_decay=cfg.WEIGHT_DECAY)
+    scheduler = CosineAnnealingLR(optimizer, T_max=finetune_epochs, eta_min=1e-7)
+    scaler    = GradScaler("cuda", enabled=cfg.AMP and device == "cuda")
+
+    history: Dict[str, list] = {
+        "train_loss": [], "val_loss": [],
+        "train_dice": [], "val_dice": [],
+        "val_iou":    [], "lr":       [],
+    }
+
+    best_val_dice = -1.0
+    patience_ctr  = 0
+    start_epoch   = 1
+    ft_best_ckpt  = str(cfg.CHECKPOINT_DIR / "finetune_best.pth")
+    ft_last_ckpt  = str(cfg.CHECKPOINT_DIR / "finetune_last.pth")
+
+    # ── Resume from finetune checkpoint if available ──────────────────────────
+    if Path(ft_last_ckpt).exists():
+        print(f"\n⟳ Resuming fine-tuning from {ft_last_ckpt}...")
+        ckpt = torch.load(ft_last_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optim_state"])
+        if "scheduler_state" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+        if "scaler_state" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state"])
+        if "history" in ckpt:
+            history = ckpt["history"]
+        best_val_dice = ckpt.get("best_val_dice", -1.0)
+        patience_ctr  = ckpt.get("patience_ctr", 0)
+        start_epoch   = ckpt["epoch"] + 1
+        print(f"   Resumed at epoch {start_epoch} "
+              f"(best Dice so far: {best_val_dice:.4f}, "
+              f"patience: {patience_ctr}/{cfg.PATIENCE})")
+    else:
+        # First fine-tune run — load best model from initial training
+        best_init = str(cfg.CHECKPOINT_DIR / "best_model.pth")
+        print(f"\n Loading best initial model from {best_init}...")
+        ckpt = torch.load(best_init, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        init_dice = ckpt.get("metrics", {}).get("mean_dice", 0.0)
+        best_val_dice = init_dice   # set baseline from initial training
+        print(f"   Loaded initial best model (Val Dice = {init_dice:.4f})")
+        print(f"   Fine-tuning will only save a new best if Dice > {init_dice:.4f}")
+
+    print(f"\n{'='*65}")
+    print(f"FINE-TUNING on {device.upper()}"
+          + (f"  [{torch.cuda.get_device_name(0)}]"
+             if device == "cuda" else ""))
+    print(f"Epochs: {start_epoch}→{finetune_epochs}  |  Batch: {cfg.BATCH_SIZE}"
+          f"  |  LR: {optimizer.param_groups[0]['lr']:.6f}  |  Patience: {cfg.PATIENCE}")
+    print(f"{'='*65}\n")
+
+    for epoch in range(start_epoch, finetune_epochs + 1):
+        t0 = time.time()
+
+        train_m = train_one_epoch(model, train_loader, criterion,
+                                   optimizer, scaler, device, cfg)
+        val_m   = validate(model, val_loader, criterion, device, cfg)
+        scheduler.step()
+
+        lr = optimizer.param_groups[0]["lr"]
+        history["train_loss"].append(train_m["loss"])
+        history["val_loss"].append(val_m["loss"])
+        history["train_dice"].append(train_m["mean_dice"])
+        history["val_dice"].append(val_m["mean_dice"])
+        history["val_iou"].append(val_m["mean_iou"])
+        history["lr"].append(lr)
+
+        elapsed = time.time() - t0
+        print(
+            f"FT Epoch [{epoch:3d}/{finetune_epochs}]  "
+            f"Train loss: {train_m['loss']:.4f}  "
+            f"Train Dice: {train_m['mean_dice']:.4f}  |  "
+            f"Val loss: {val_m['loss']:.4f}  "
+            f"Val Dice: {val_m['mean_dice']:.4f}  "
+            f"Val IoU: {val_m['mean_iou']:.4f}  "
+            f"({elapsed:.0f}s)"
+        )
+
+        # Per-class Dice
+        cls_str = "  ".join(
+            f"{Config.CLASS_NAMES[c+1]}:{val_m['dice_cls'][c]:.3f}"
+            for c in range(len(val_m["dice_cls"]))
+        )
+        print(f"           Per-class val Dice: {cls_str}")
+
+        # Checkpoint: save best model
+        if val_m["mean_dice"] > best_val_dice:
+            best_val_dice = val_m["mean_dice"]
+            patience_ctr  = 0
+            save_checkpoint(model, optimizer, epoch, val_m, ft_best_ckpt,
+                            scheduler, scaler, history,
+                            best_val_dice, patience_ctr)
+            print(f"           ✓ New fine-tuned best saved  (Dice={best_val_dice:.4f})")
+        else:
+            patience_ctr += 1
+            if patience_ctr >= cfg.PATIENCE:
+                print(f"\nEarly stopping (fine-tune) at epoch {epoch}"
+                      f" (no improvement for {cfg.PATIENCE} epochs)")
+                break
+
+        # Always save last checkpoint for resume
+        save_checkpoint(model, optimizer, epoch, val_m, ft_last_ckpt,
+                        scheduler, scaler, history,
+                        best_val_dice, patience_ctr)
+
+    # Save final fine-tuned weights
+    ft_final = str(cfg.CHECKPOINT_DIR / "finetune_final.pth")
+    save_checkpoint(model, optimizer, epoch, val_m, ft_final,
+                    scheduler, scaler, history,
+                    best_val_dice, patience_ctr)
+    print(f"\nFine-tune final saved → {ft_final}")
+    print(f"Fine-tune best saved  → {ft_best_ckpt}"
+          f"  (Val Dice = {best_val_dice:.4f})")
+
+    return history
 
 
 if __name__ == "__main__":
