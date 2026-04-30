@@ -4,16 +4,16 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── Monochrome Design System ───────────────────────────────────────────────
-#let c-black      = rgb("#0a0a0a")    // rich black
-#let c-charcoal   = rgb("#1f1f1f")    // primary dark
-#let c-graphite   = rgb("#2d2d2d")    // secondary dark
-#let c-slate      = rgb("#404040")    // mid tone
-#let c-steel      = rgb("#6b6b6b")    // body text
-#let c-silver     = rgb("#a3a3a3")    // muted
-#let c-platinum   = rgb("#d4d4d4")    // borders
-#let c-pearl      = rgb("#e8e8e8")    // light bg
-#let c-ivory      = rgb("#f5f5f5")    // off-white
-#let c-white      = rgb("#ffffff")    // pure white
+#let c-black = rgb("#0a0a0a")    // rich black
+#let c-charcoal = rgb("#1f1f1f")    // primary dark
+#let c-graphite = rgb("#2d2d2d")    // secondary dark
+#let c-slate = rgb("#404040")    // mid tone
+#let c-steel = rgb("#6b6b6b")    // body text
+#let c-silver = rgb("#a3a3a3")    // muted
+#let c-platinum = rgb("#d4d4d4")    // borders
+#let c-pearl = rgb("#e8e8e8")    // light bg
+#let c-ivory = rgb("#f5f5f5")    // off-white
+#let c-white = rgb("#ffffff")    // pure white
 
 // ── Typography ─────────────────────────────────────────────────────────────
 #set text(font: "New Computer Modern", size: 10.5pt, fill: c-charcoal, ligatures: true)
@@ -92,7 +92,13 @@
 
 // ── Components ─────────────────────────────────────────────────────────────
 #let info-box(title: "", body) = {
-  rect(width: 100%, fill: c-ivory, stroke: (left: 3pt + c-slate, rest: 0.8pt + c-platinum), radius: (right: 6pt, left: 3pt), inset: 12pt)[
+  rect(
+    width: 100%,
+    fill: c-ivory,
+    stroke: (left: 3pt + c-slate, rest: 0.8pt + c-platinum),
+    radius: (right: 6pt, left: 3pt),
+    inset: 12pt,
+  )[
     #if title != "" [#text(weight: "bold", fill: c-graphite, size: 9.5pt, tracking: 0.5pt)[#upper(title)] #v(4pt)]
     #set text(size: 9.5pt)
     #body
@@ -100,7 +106,13 @@
 }
 
 #let insight-box(body) = {
-  rect(width: 100%, fill: c-ivory, stroke: (left: 3pt + c-black, rest: 0.8pt + c-platinum), radius: (right: 6pt, left: 3pt), inset: 12pt)[
+  rect(
+    width: 100%,
+    fill: c-ivory,
+    stroke: (left: 3pt + c-black, rest: 0.8pt + c-platinum),
+    radius: (right: 6pt, left: 3pt),
+    inset: 12pt,
+  )[
     #text(weight: "bold", fill: c-black, size: 9.5pt)[Key Insight] #v(4pt)
     #set text(size: 9.5pt)
     #body
@@ -142,28 +154,28 @@
     #align(center)[
       #rect(width: 80pt, height: 2pt, fill: c-silver, radius: 1pt)
       #v(24pt)
-      
+
       #rect(fill: c-charcoal, radius: 4pt, inset: (x: 12pt, y: 6pt), stroke: 0.5pt + c-slate)[
         #text(size: 10pt, fill: c-white, weight: "bold", tracking: 2pt)[GROUP COURSEWORK]
       ]
       #v(16pt)
-      
+
       #text(font: "New Computer Modern", size: 10pt, fill: c-silver, weight: "bold", tracking: 3pt)[
         CN6021 — ADVANCED TOPICS IN AI & DATA SCIENCE
       ]
       #v(16pt)
-      
-      #text(font: "New Computer Modern", size: 30pt, fill: c-white, weight: "bold")[Final Submission Portfolio]
+
+      #text(font: "New Computer Modern", size: 30pt, fill: c-white, weight: "bold")[Final Submission]
       #v(8pt)
       #text(font: "New Computer Modern", size: 14pt, fill: c-silver)[
         Task 1: Customer Churn Prediction \
         Task 2: 3D Brain Tumour Segmentation
       ]
-      
+
       #v(20pt)
       #rect(width: 60pt, height: 1pt, fill: c-graphite)
       #v(16pt)
-      
+
       #text(size: 11pt, fill: c-silver)[Group Coursework Submission]
       #v(6pt)
       #text(size: 10pt, fill: c-steel)[
@@ -301,7 +313,7 @@ We evaluate the final model on the held-out test set (10,000 samples, unseen dur
   figure(
     image("outputs/08_roc_curve.png", width: 100%),
     caption: [ROC Curve.],
-  )
+  ),
 )
 
 The model achieves an *AUC-ROC of 0.9172*, indicating excellent discriminative ability. The high recall for the churned class (85%) demonstrates that the weighted loss function successfully addressed the class imbalance.
@@ -344,22 +356,19 @@ Understanding *why* the model makes certain predictions is critical for business
   stroke: (top: 0.5pt + c-charcoal, bottom: 0.5pt + c-slate),
   breakable: true,
 )[
-#text(size: 12pt, weight: "bold", fill: c-black)[Executive Summary]
-#v(8pt)
-We developed an interpretable, computationally lightweight churn prediction system meeting all coursework constraints:
+  #text(size: 12pt, weight: "bold", fill: c-black)[Executive Summary]
+  #v(8pt)
+  We developed an interpretable, computationally lightweight churn prediction system meeting all coursework constraints:
 
-#v(6pt)
-#grid(
-  columns: (1fr, 1fr),
-  column-gutter: 16pt,
-  row-gutter: 10pt,
-  [✓ *AUC-ROC: 0.917* and *Macro F1: 0.860*],
-  [✓ *High-dimensionality addressed* via MI selection],
-  [✓ *Class imbalance solved* via Weighted BCE loss],
-  [✓ *Non-linearity handled* via ReLU hidden layer],
-  [✓ *Built entirely in NumPy* for compute constraints],
-  [✓ *Highly interpretable* via Permutation Importance],
-)
+  #v(6pt)
+  #grid(
+    columns: (1fr, 1fr),
+    column-gutter: 16pt,
+    row-gutter: 10pt,
+    [✓ *AUC-ROC: 0.917* and *Macro F1: 0.860*], [✓ *High-dimensionality addressed* via MI selection],
+    [✓ *Class imbalance solved* via Weighted BCE loss], [✓ *Non-linearity handled* via ReLU hidden layer],
+    [✓ *Built entirely in NumPy* for compute constraints], [✓ *Highly interpretable* via Permutation Importance],
+  )
 ]
 
 The pipeline demonstrates that careful preprocessing, weighted loss functions, and disciplined hyperparameter tuning can yield highly performant and interpretable models without resorting to deep learning.
@@ -379,7 +388,7 @@ The pipeline demonstrates that careful preprocessing, weighted loss functions, a
 
 == Introduction
 
-Brain tumour segmentation is vital for treatment planning and monitoring. However, manual segmentation is slow and subjective. This report presents a *3D Squeeze-and-Excitation (SE) U-Net* pipeline in PyTorch, addressing 3D volumetric complexity, extreme class imbalance (tumour < 2% volume), and varied morphology. 
+Brain tumour segmentation is vital for treatment planning and monitoring. However, manual segmentation is slow and subjective. This report presents a *3D Squeeze-and-Excitation (SE) U-Net* pipeline in PyTorch, addressing 3D volumetric complexity, extreme class imbalance (tumour < 2% volume), and varied morphology.
 
 Using the *BraTS 2024 Adult Glioma* dataset, we implement memory-efficient training (AMP, patch-sampling) and transfer learning (2D-to-3D weight inflation) to achieve high-fidelity segmentation across three sub-regions: Necrotic Core (NCR), Oedema (ED), and Enhancing Tumour (ET).
 
@@ -401,9 +410,7 @@ The BraTS 2024 GLI dataset contains *1,809 patient cases*, each comprising four 
     align: (center, left, left),
     stroke: none,
     table.hline(stroke: 2pt + c-charcoal),
-    table.header(
-      [*Label*], [*Region*], [*Clinical Significance*],
-    ),
+    table.header([*Label*], [*Region*], [*Clinical Significance*]),
     table.hline(stroke: 0.5pt + c-platinum),
     [0], [Background], [Healthy brain tissue],
     [1], [Necrotic Core (NCR)], [Dead tissue at tumour centre],
@@ -480,23 +487,23 @@ We employ a *3D U-Net* — the dominant paradigm for volumetric medical image se
   #set text(size: 8.5pt, font: "DejaVu Sans Mono")
 
   Input (2 × 96³)
-├─ Enc1: ConvBlock(2→16)   ─────────────────┐ Skip
-│  └─ MaxPool3D                               │
-├─ Enc2: ConvBlock(16→32)  ────────────┐      │
-│  └─ MaxPool3D                         │     │
-├─ Enc3: ConvBlock(32→64)  ───────┐     │     │
-│  └─ MaxPool3D                    │    │     │
-├─ Enc4: ConvBlock(64→128) ──┐    │    │     │
-│  └─ MaxPool3D               │   │    │     │
-│                              │   │    │     │
-├─ Bottleneck (128→256)       │   │    │     │
-│                              │   │    │     │
-├─ Dec4: Up + Cat ←───────────┘   │    │     │
-├─ Dec3: Up + Cat ←───────────────┘    │     │
-├─ Dec2: Up + Cat ←────────────────────┘     │
-├─ Dec1: Up + Cat ←──────────────────────────┘
-│
-└─ Output: Conv3D(16→4, k=1) → Softmax
+  ├─ Enc1: ConvBlock(2→16)   ─────────────────┐ Skip
+  │  └─ MaxPool3D                               │
+  ├─ Enc2: ConvBlock(16→32)  ────────────┐      │
+  │  └─ MaxPool3D                         │     │
+  ├─ Enc3: ConvBlock(32→64)  ───────┐     │     │
+  │  └─ MaxPool3D                    │    │     │
+  ├─ Enc4: ConvBlock(64→128) ──┐    │    │     │
+  │  └─ MaxPool3D               │   │    │     │
+  │                              │   │    │     │
+  ├─ Bottleneck (128→256)       │   │    │     │
+  │                              │   │    │     │
+  ├─ Dec4: Up + Cat ←───────────┘   │    │     │
+  ├─ Dec3: Up + Cat ←───────────────┘    │     │
+  ├─ Dec2: Up + Cat ←────────────────────┘     │
+  ├─ Dec1: Up + Cat ←──────────────────────────┘
+  │
+  └─ Output: Conv3D(16→4, k=1) → Softmax
 ]
 
 *Key architectural innovations:*
@@ -521,7 +528,9 @@ where $lambda_"dice" = 0.6$ and $lambda_"focal" = 0.4$.
 
 *Soft Dice Loss* optimises overlap directly, treating each class equally:
 
-$ cal(L)_"dice" = 1 - 1/C sum_(c=1)^C (2 sum_i p_(i c) dot g_(i c) + epsilon) / (sum_i p_(i c) + sum_i g_(i c) + epsilon) $
+$
+  cal(L)_"dice" = 1 - 1/C sum_(c=1)^C (2 sum_i p_(i c) dot g_(i c) + epsilon) / (sum_i p_(i c) + sum_i g_(i c) + epsilon)
+$
 
 *Focal Loss* down-weights easy voxels and focuses on hard boundary regions:
 
@@ -542,24 +551,24 @@ The decoder pathway remained randomly initialised to prevent bias toward non-med
 === Training Configuration
 
 #figure(
-table(
-  columns: (auto, auto, auto),
-  align: (left, center, left),
-  stroke: none,
-  table.hline(stroke: 2pt + c-charcoal),
-  table.header([*Parameter*], [*Value*], [*Rationale*]),
-  table.hline(stroke: 0.5pt + c-platinum),
-  [Optimiser], [AdamW], [Decoupled weight decay],
-  [Initial LR], [1×10⁻³], [Standard for 3D segmentation],
-  [Weight Decay], [1×10⁻⁵], [Mild L2 regularisation],
-  [Batch Size], [2], [Maximises GPU memory efficiency],
-  [Grad Accumulation], [2 steps], [Effective batch = 4],
-  [Gradient Clipping], [1.0], [Prevents gradient explosion],
-  [Mixed Precision], [Enabled], [Reduces memory; ~30% speedup],
-  [Early Stopping], [Patience 10], [Val Dice monitor],
-  table.hline(stroke: 2pt + c-charcoal),
-),
-caption: [Training hyperparameters.],
+  table(
+    columns: (auto, auto, auto),
+    align: (left, center, left),
+    stroke: none,
+    table.hline(stroke: 2pt + c-charcoal),
+    table.header([*Parameter*], [*Value*], [*Rationale*]),
+    table.hline(stroke: 0.5pt + c-platinum),
+    [Optimiser], [AdamW], [Decoupled weight decay],
+    [Initial LR], [1×10⁻³], [Standard for 3D segmentation],
+    [Weight Decay], [1×10⁻⁵], [Mild L2 regularisation],
+    [Batch Size], [2], [Maximises GPU memory efficiency],
+    [Grad Accumulation], [2 steps], [Effective batch = 4],
+    [Gradient Clipping], [1.0], [Prevents gradient explosion],
+    [Mixed Precision], [Enabled], [Reduces memory; ~30% speedup],
+    [Early Stopping], [Patience 10], [Val Dice monitor],
+    table.hline(stroke: 2pt + c-charcoal),
+  ),
+  caption: [Training hyperparameters.],
 )
 
 ==== Learning Rate Schedule
@@ -578,13 +587,13 @@ We implemented a custom PyTorch training loop incorporating GPU acceleration and
 
 == Results
 
-==== Training Progression
+=== Training Progression
 
 The model trained for the full *50 epochs* without early stopping being triggered.
 
 #figure(
-image("outputs/results/training_curves.png", width: 95%),
-caption: [Training curves: loss, Dice score, and learning rate over 50 epochs.],
+  image("outputs/results/training_curves.png", width: 95%),
+  caption: [Training curves: loss, Dice score, and learning rate over 50 epochs.],
 ) <fig-curves-task2-2>
 
 Key observations:
@@ -593,43 +602,43 @@ Key observations:
 - *Best performance*: Peak validation Dice of *0.7639* at epoch 48.
 - *No overfitting*: Training and validation curves track closely.
 
-==== Test Set Evaluation
+=== Test Set Evaluation
 
 #v(8pt)
 #grid(
-columns: (1fr, 1fr, 1fr, 1fr),
-column-gutter: 10pt,
-metric-card("Mean Dice", "0.775"),
-metric-card("Mean IoU", "0.704"),
-metric-card("Best Epoch", "48"),
-metric-card("Parameters", "6.05M"),
+  columns: (1fr, 1fr, 1fr, 1fr),
+  column-gutter: 10pt,
+  metric-card("Mean Dice", "0.775"),
+  metric-card("Mean IoU", "0.704"),
+  metric-card("Best Epoch", "48"),
+  metric-card("Parameters", "6.05M"),
 )
 #v(10pt)
 
 #figure(
-table(
-  columns: (auto, auto, auto, auto),
-  align: (left, center, center, center),
-  stroke: none,
-  table.hline(stroke: 2pt + c-charcoal),
-  table.header([*Tumour Region*], [*Dice Score*], [*IoU*], [*Hausdorff (mm)*]),
-  table.hline(stroke: 0.5pt + c-platinum),
-  [Necrotic Core], [*0.769*], [0.728], [12.07],
-  [Peritumoral Oedema], [*0.822*], [0.744], [23.76],
-  [Enhancing Tumour], [*0.735*], [0.641], [21.19],
-  table.hline(stroke: 0.8pt + c-platinum),
-  [*Mean (Foreground)*], [*0.775*], [*0.704*], [—],
-  table.hline(stroke: 2pt + c-charcoal),
-),
-caption: [Test set segmentation metrics on 90 held-out patients.],
+  table(
+    columns: (auto, auto, auto, auto),
+    align: (left, center, center, center),
+    stroke: none,
+    table.hline(stroke: 2pt + c-charcoal),
+    table.header([*Tumour Region*], [*Dice Score*], [*IoU*], [*Hausdorff (mm)*]),
+    table.hline(stroke: 0.5pt + c-platinum),
+    [Necrotic Core], [*0.769*], [0.728], [12.07],
+    [Peritumoral Oedema], [*0.822*], [0.744], [23.76],
+    [Enhancing Tumour], [*0.735*], [0.641], [21.19],
+    table.hline(stroke: 0.8pt + c-platinum),
+    [*Mean (Foreground)*], [*0.775*], [*0.704*], [—],
+    table.hline(stroke: 2pt + c-charcoal),
+  ),
+  caption: [Test set segmentation metrics on 90 held-out patients.],
 ) <tbl-results-task2-2>
 
 #figure(
-image("outputs/results/dice_per_class.png", width: 65%),
-caption: [Per-class Dice scores on the test set.],
+  image("outputs/results/dice_per_class.png", width: 65%),
+  caption: [Per-class Dice scores on the test set.],
 )
 
-==== Per-Class Analysis
+=== Per-Class Analysis
 
 *Peritumoral Oedema (Dice = 0.822)* achieves the highest score, consistent with its larger spatial extent and high contrast on T2-FLAIR. The U-Net's multi-scale features capture its diffuse boundaries well.
 
@@ -637,23 +646,23 @@ caption: [Per-class Dice scores on the test set.],
 
 *Enhancing Tumour (Dice = 0.735)* is the most challenging due to its thin, ring-like morphology. Focal Loss with $gamma = 2.0$ up-weights hard boundary voxels to address this.
 
-==== Qualitative Results
+=== Qualitative Results
 
 Visual inspection of model predictions on the held-out test set (see @fig-samples-appendix) confirms high spatial overlap with ground truth, particularly in the Necrotic Core and Peritumoral Oedema regions.
 
 
-==== Fine-Tuning Experiment
+=== Fine-Tuning Experiment
 
 Following initial training, a *fine-tuning phase* used the best model (epoch 48) with 10× lower LR (1×10⁻⁴) and cosine annealing. Early stopping triggered after 9 epochs — no epoch exceeded the baseline Dice of 0.7639, confirming the initial training had converged to a strong solution.
 
 #insight-box[
-Fine-tuning improved *Necrotic Core* (0.769 → 0.802 Dice) at the expense of Oedema, suggesting a trade-off in the loss landscape between sub-region specialisation. The initial model remains the best overall.
+  Fine-tuning improved *Necrotic Core* (0.769 → 0.802 Dice) at the expense of Oedema, suggesting a trade-off in the loss landscape between sub-region specialisation. The initial model remains the best overall.
 ]
 
 
 == Analysis and Conclusions
 
-Achieving a mean Dice of *0.775* with only 33% of the available data demonstrates the efficacy of our SE-Attention architecture and the Focal+Dice combined loss. The system successfully handles extreme class imbalance and volumetric complexity through foreground-biased sampling and memory-efficient training (AMP). 
+Achieving a mean Dice of *0.775* with only 33% of the available data demonstrates the efficacy of our SE-Attention architecture and the Focal+Dice combined loss. The system successfully handles extreme class imbalance and volumetric complexity through foreground-biased sampling and memory-efficient training (AMP).
 
 While the current model is highly performant, future improvements could include training on the full 1,809-patient dataset, incorporating additional MRI modalities (T1n, T2w), and applying post-processing (e.g., connected component analysis) to further refine boundaries and reduce false positives.
 
@@ -672,12 +681,9 @@ While the current model is highly performant, future improvements could include 
     columns: (1fr, 1fr),
     column-gutter: 20pt,
     row-gutter: 12pt,
-    [✓ *Mean Dice Score: 0.775* (Test set)],
-    [✓ *SE-Attention U-Net* architecture],
-    [✓ *Combined Focal + Dice Loss*],
-    [✓ *2D-to-3D Transfer Learning*],
-    [✓ *Memory Efficient Training* (AMP)],
-    [✓ *Full Pipeline Automation*],
+    [✓ *Mean Dice Score: 0.775* (Test set)], [✓ *SE-Attention U-Net* architecture],
+    [✓ *Combined Focal + Dice Loss*], [✓ *2D-to-3D Transfer Learning*],
+    [✓ *Memory Efficient Training* (AMP)], [✓ *Full Pipeline Automation*],
   )
 ]
 
@@ -720,7 +726,7 @@ The pipeline is fully automated — from dataset verification through training, 
   - Hidden Units: [16, 32, 64]
   - Learning Rate: [0.1, 0.05, 0.01]
   - L2 Lambda: [0.01, 0.001, 0.0001]
-  
+
   The 32-unit configuration with 0.05 learning rate provided the best balance between convergence speed and validation generalisation.
 ]
 
@@ -766,6 +772,7 @@ The pipeline is fully automated — from dataset verification through training, 
   row-gutter: 10pt,
   figure(image("outputs/results/sample_predictions/sample_01.png", width: 100%), caption: [Sample 1]),
   figure(image("outputs/results/sample_predictions/sample_02.png", width: 100%), caption: [Sample 2]),
+
   figure(image("outputs/results/sample_predictions/sample_03.png", width: 100%), caption: [Sample 3]),
   figure(image("outputs/results/sample_predictions/sample_04.png", width: 100%), caption: [Sample 4]),
 )
