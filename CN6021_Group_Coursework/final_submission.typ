@@ -479,34 +479,10 @@ To address limited annotated data, we apply four on-the-fly augmentation strateg
 
 We employ a *3D U-Net* — the dominant paradigm for volumetric medical image segmentation — with an encoder–decoder structure and skip connections.
 
-#rect(
-  width: 100%,
-  fill: c-ivory,
-  radius: 8pt,
-  inset: 16pt,
-  stroke: 0.5pt + c-platinum,
-)[
-  #set text(size: 8.5pt, font: "DejaVu Sans Mono")
-
-  Input (2 × 96³)
-  ├─ Enc1: ConvBlock(2→16)   ─────────────────┐ Skip
-  │  └─ MaxPool3D                               │
-  ├─ Enc2: ConvBlock(16→32)  ────────────┐      │
-  │  └─ MaxPool3D                         │     │
-  ├─ Enc3: ConvBlock(32→64)  ───────┐     │     │
-  │  └─ MaxPool3D                    │    │     │
-  ├─ Enc4: ConvBlock(64→128) ──┐    │    │     │
-  │  └─ MaxPool3D               │   │    │     │
-  │                              │   │    │     │
-  ├─ Bottleneck (128→256)       │   │    │     │
-  │                              │   │    │     │
-  ├─ Dec4: Up + Cat ←───────────┘   │    │     │
-  ├─ Dec3: Up + Cat ←───────────────┘    │     │
-  ├─ Dec2: Up + Cat ←────────────────────┘     │
-  ├─ Dec1: Up + Cat ←──────────────────────────┘
-  │
-  └─ Output: Conv3D(16→4, k=1) → Softmax
-]
+#figure(
+  image("Architecture.png", width: 100%),
+  caption: [3D U-Net Architecture with Squeeze-and-Excitation Blocks.],
+)
 
 *Key architectural innovations:*
 
@@ -671,14 +647,14 @@ While the current model is highly performant, future improvements could include 
 
 #block(
   width: 100%,
-  fill: c-black,
+  fill: c-ivory,
   radius: 8pt,
   inset: 18pt,
   stroke: 0.5pt + c-slate,
 )[
-  #text(size: 13pt, weight: "bold", fill: c-white)[Final Performance Summary]
+  #text(size: 13pt, weight: "bold", fill: c-black)[Final Performance Summary]
   #v(8pt)
-  #set text(fill: c-silver, size: 10pt)
+  #set text(fill: c-black, size: 10pt)
   #grid(
     columns: (1fr, 1fr),
     column-gutter: 20pt,
