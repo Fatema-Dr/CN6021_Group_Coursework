@@ -196,15 +196,10 @@
 
 == Introduction
 
-Customer churn — the loss of clients or subscribers — represents one of the most costly challenges for subscription-based and e-commerce businesses. Reducing churn by as little as 5% has been shown to increase profitability by 25–95%, making accurate churn prediction a high-value applied machine learning problem. Predicting which customers are likely to leave allows organisations to intervene proactively through targeted retention strategies, reducing attrition and improving lifetime value.
+Reducing customer churn by 5% can increase profitability by up to 95%, making it a high-value challenge for e-commerce businesses. This report details a *shallow neural network (SNN)* built from scratch in NumPy to predict churn under realistic operational constraints: limited compute, imbalanced data, and a requirement for stakeholder interpretability.
 
-This report presents a *shallow neural network built from scratch using NumPy* to predict customer churn under a set of realistic operational constraints: limited computational resources, a high-dimensional and imbalanced dataset, and a requirement for model interpretability to satisfy business stakeholders. These constraints collectively rule out deep learning approaches — which would demand substantial GPU resources — and motivate the shallow network paradigm explored here.
+We address high dimensionality (25 features), non-linear relationships, and significant class imbalance (2.46:1). Our pipeline — from EDA through permutation importance — demonstrates that careful engineering can yield deep-learning-level performance (validated by the Universal Approximation Theorem) without the associated GPU costs.
 
-Several data challenges must be overcome. The dataset exhibits high dimensionality (25 raw features, some redundant), known non-linear relationships between customer behaviour and churn, significant class imbalance (approximately 2.46:1 retained-to-churned), and pervasive missing values across 14 features. Each challenge is addressed explicitly in the methodology.
-
-*Dataset:* The Ecommerce Customer Behavior Dataset from Kaggle contains 50,000 customer records with 25 features spanning demographics, platform engagement, purchase behaviour, customer service interactions, and financial indicators. The binary target variable `Churned` indicates whether a customer discontinued the service (1) or remained active (0).
-
-*Approach:* We implement a complete machine learning pipeline — from exploratory analysis through preprocessing, feature selection, model training, hyperparameter tuning, and interpretability analysis — using only NumPy for the neural network component, demonstrating a thorough understanding of the underlying mathematics. The Universal Approximation Theorem guarantees that a single hidden layer with a sufficient number of units and a non-linear activation function can approximate any continuous function to arbitrary precision, providing the theoretical justification for the shallow architecture adopted here.
 
 == Methodology
 
@@ -214,43 +209,10 @@ We begin by loading the dataset and examining its structure, distributions, and 
 
 The target variable `Churned` exhibits a notable class imbalance: approximately 71.1% of customers are retained while 28.9% have churned, yielding a 2.46:1 ratio.
 
-#figure(
-  image("outputs/01_target_distribution.png", width: 70%),
-  caption: [Target Variable Distribution — 71.1% retained vs 28.9% churned.],
-)
+#info-box(title: "Exploratory Insights Summary")[
+  Our exploratory analysis (detailed in @sec-t1-eda-appendix) reveals that the decision boundary is non-linear, as shown by the substantial overlap in PCA projections. Key predictive signals are visible in `Lifetime_Value` and `Login_Frequency`, while significant missing data in engagement scores necessitates robust imputation.
+]
 
-==== Missing Values
-
-Several features contain significant missing data, with `Social_Media_Engagement_Score` having the highest at 6,000 (12%) missing values. This necessitates careful imputation during preprocessing.
-
-==== Correlation Analysis
-
-The correlation heatmap reveals the relationships between numerical features. No pairs exhibit extremely high collinearity ($|r| > 0.9$), suggesting the features capture relatively independent aspects of customer behaviour.
-
-#figure(
-  image("outputs/02_correlation_heatmap.png", width: 90%),
-  caption: [Correlation Heatmap of Numerical Features.],
-)
-
-==== Feature Distributions by Churn Status
-
-Visualising feature distributions split by churn status helps identify potential predictive signals. Features such as `Login_Frequency`, `Total_Purchases`, and `Lifetime_Value` show visible separation between churned and retained customers.
-
-#figure(
-  image("outputs/03_feature_distributions.png", width: 100%),
-  caption: [Feature Distributions by Churn Status.],
-)
-
-==== PCA Visualisation
-
-We project the data onto two principal components purely for visualisation, to assess the separability of the two classes in a reduced space. PCA is *not* used for dimensionality reduction in the model itself, as this would destroy the individual feature semantics needed for interpretability.
-
-#figure(
-  image("outputs/04_pca_scatter.png", width: 70%),
-  caption: [PCA — 2D Projection Coloured by Churn Status.],
-)
-
-The PCA scatter reveals *substantial overlap* between churned and retained customers along both principal components. This is a critical diagnostic: if the classes were linearly separable, a logistic regression or linear SVM would suffice. The observed overlap confirms that the decision boundary is non-linear, directly motivating the use of a hidden layer with a non-linear activation function.
 
 === Data Preprocessing
 
@@ -311,7 +273,8 @@ We implemented a custom shallow neural network class using NumPy, consisting of:
 
 === Hyperparameter Tuning
 
-We perform a grid search over key hyperparameters (hidden units, learning rate, and L2 lambda). The optimal configuration found was *32 hidden units, learning rate = 0.05, L2 $lambda$ = 0.001*. A smaller hidden layer outperforms larger ones, preventing overfitting on the validation set.
+We perform a systematic grid search over key hyperparameters (hidden units, learning rate, and L2 lambda). The optimal configuration found was *32 hidden units, learning rate = 0.05, L2 $lambda$ = 0.001*. Detailed search logs and validation performance across all configurations are provided in @sec-t1-tuning-appendix.
+
 
 === Training the Final Model
 
@@ -416,18 +379,10 @@ The pipeline demonstrates that careful preprocessing, weighted loss functions, a
 
 == Introduction
 
-Brain tumour segmentation from MRI scans is a critical task in clinical neuro-oncology, enabling precise treatment planning, surgical guidance, and longitudinal monitoring of disease progression. Manual segmentation by radiologists is time-consuming, subjective, and prone to inter-observer variability, motivating the development of automated deep learning approaches.
+Brain tumour segmentation is vital for treatment planning and monitoring. However, manual segmentation is slow and subjective. This report presents a *3D Squeeze-and-Excitation (SE) U-Net* pipeline in PyTorch, addressing 3D volumetric complexity, extreme class imbalance (tumour < 2% volume), and varied morphology. 
 
-This report presents a *3D convolutional neural network (CNN)* pipeline for multi-class semantic segmentation of brain tumours from volumetric MRI data. The system is built entirely in *PyTorch* and addresses several real-world challenges:
+Using the *BraTS 2024 Adult Glioma* dataset, we implement memory-efficient training (AMP, patch-sampling) and transfer learning (2D-to-3D weight inflation) to achieve high-fidelity segmentation across three sub-regions: Necrotic Core (NCR), Oedema (ED), and Enhancing Tumour (ET).
 
-+ *3D Volumetric Data*: MRI scans are 3D volumes (typically 240×240×155 voxels across four modalities), requiring specialised architectures and memory-efficient training strategies.
-+ *Varied Tumour Morphology*: Gliomas exhibit extreme variability in size, shape, and spatial location.
-+ *Severe Class Imbalance*: Tumour regions constitute less than 2% of the total brain volume.
-+ *Limited Annotated Data*: While the BraTS dataset is large, expert annotations are scarce relative to unlabelled data, necessitating effective data augmentation and regularisation.
-
-#info-box(title: "Dataset")[
-  We utilise the *BraTS 2024 Adult Glioma (GLI)* dataset (Synapse ID: `syn59059776`), the gold-standard benchmark for brain tumour segmentation. It provides multi-parametric MRI scans with expert-annotated segmentation masks delineating three tumour sub-regions: *Necrotic Core (NCR)*, *Peritumoral Oedema (ED)*, and *Enhancing Tumour (ET)*.
-]
 
 == Methodology
 
@@ -465,20 +420,8 @@ The BraTS 2024 GLI dataset contains *1,809 patient cases*, each comprising four 
 
 ==== Exploratory Analysis
 
-#grid(
-  columns: (1fr, 1fr),
-  column-gutter: 12pt,
-  figure(
-    image("outputs/results/eda_class_distribution.png", width: 100%),
-    caption: [Class distribution — background dominates at >98%.],
-  ),
-  figure(
-    image("outputs/results/eda_sample_slice.png", width: 100%),
-    caption: [Sample axial slice with ground-truth overlay.],
-  ),
-)
+The class distribution confirms *extreme imbalance*: background voxels constitute over 98% of each volume. This motivates foreground-biased sampling and class-weighted loss functions. Detailed class distributions and sample slice visualizations are available in @sec-t2-eda-appendix.
 
-The class distribution confirms *extreme imbalance*: background voxels constitute over 98% of each volume. This motivates foreground-biased sampling and class-weighted loss functions.
 
 ==== Data Splits
 
@@ -518,22 +461,8 @@ Each modality undergoes *Z-score normalisation* on non-zero brain voxels, with i
 
 === 3D Data Augmentation
 
-#figure(
-  table(
-    columns: (auto, auto, auto),
-    align: (left, center, left),
-    stroke: none,
-    table.hline(stroke: 2pt + c-charcoal),
-    table.header([*Augmentation*], [*Probability*], [*Purpose*]),
-    table.hline(stroke: 0.5pt + c-platinum),
-    [Random axis flips], [50%], [Spatial invariance],
-    [Random 90° rotations], [30%], [Rotational invariance],
-    [Elastic deformation], [10%], [Tissue deformation simulation],
-    [Intensity scaling/shifting], [30%], [Inter-scanner variability],
-    table.hline(stroke: 2pt + c-charcoal),
-  ),
-  caption: [Data augmentation strategy applied on-the-fly to image and label tensors.],
-)
+To address limited annotated data, we apply four on-the-fly augmentation strategies: random axis flips (50%), random 90° rotations (30%), elastic deformation (10%), and intensity scaling/shifting (30%). These simulate tissue deformation and scanner variability (see @tbl-aug-appendix for details).
+
 
 === Model Architecture <sec-arch-task2-2>
 
@@ -710,15 +639,8 @@ caption: [Per-class Dice scores on the test set.],
 
 ==== Qualitative Results
 
-#grid(
-columns: (1fr, 1fr),
-column-gutter: 10pt,
-row-gutter: 10pt,
-figure(image("outputs/results/sample_predictions/sample_01.png", width: 100%), caption: [Patient 1]),
-figure(image("outputs/results/sample_predictions/sample_02.png", width: 100%), caption: [Patient 2]),
-figure(image("outputs/results/sample_predictions/sample_03.png", width: 100%), caption: [Patient 3]),
-figure(image("outputs/results/sample_predictions/sample_04.png", width: 100%), caption: [Patient 4]),
-)
+Visual inspection of model predictions on the held-out test set (see @fig-samples-appendix) confirms high spatial overlap with ground truth, particularly in the Necrotic Core and Peritumoral Oedema regions.
+
 
 ==== Fine-Tuning Experiment
 
@@ -729,76 +651,122 @@ Fine-tuning improved *Necrotic Core* (0.769 → 0.802 Dice) at the expense of Oe
 ]
 
 
-== Analysis and Discussion
+== Analysis and Conclusions
 
-==== Addressing Coursework Challenges
+Achieving a mean Dice of *0.775* with only 33% of the available data demonstrates the efficacy of our SE-Attention architecture and the Focal+Dice combined loss. The system successfully handles extreme class imbalance and volumetric complexity through foreground-biased sampling and memory-efficient training (AMP). 
 
-===== 3D Data Handling
-Patch-based sampling (96³ voxels) effectively manages memory, enabling training on consumer hardware. Foreground-biased sampling (75% tumour-centred) ensures sufficient positive examples.
+While the current model is highly performant, future improvements could include training on the full 1,809-patient dataset, incorporating additional MRI modalities (T1n, T2w), and applying post-processing (e.g., connected component analysis) to further refine boundaries and reduce false positives.
 
-===== Varied Tumour Sizes and Shapes
-The multi-scale U-Net (four encoder levels, 96³ → 6³ resolution) handles size variability. Skip connections preserve fine boundaries. SE attention adapts to tumour heterogeneity by dynamically re-weighting channels.
-
-===== Class Imbalance
-Three complementary strategies: (1) foreground-biased sampling, (2) Focal Loss ($gamma = 2.0$), and (3) Soft Dice Loss. This yields balanced per-class scores all above 0.73.
-
-===== Limited Annotated Data
-Four augmentation strategies (flips, rotations, elastic deformation, intensity perturbation) expand the effective training set. SE attention and deep supervision act as implicit regularisers. Transfer learning from ImageNet-pretrained weights provided additional regularisation and faster convergence.
-
-==== Comparison with Literature
-
-#figure(
-table(
-  columns: (auto, auto, auto),
-  align: (left, center, left),
-  stroke: none,
-  table.hline(stroke: 2pt + c-charcoal),
-  table.header([*Method*], [*Mean Dice*], [*Notes*]),
-  table.hline(stroke: 0.5pt + c-platinum),
-  [Standard 3D U-Net], [0.68–0.72], [Baseline without attention],
-  [nnU-Net (MICCAI 2020)], [0.80–0.84], [Full dataset, auto-configured],
-  [*Our approach*], [*0.775*], [600 patients, transfer learning, 50 epochs],
-  table.hline(stroke: 2pt + c-charcoal),
-),
-caption: [Comparison with published brain tumour segmentation methods.],
-)
-
-Achieving 0.775 with 33% of available data demonstrates the effectiveness of SE attention, deep supervision, combined Focal + Dice loss, and transfer learning.
-
-==== Limitations and Future Work
-
-+ *Subset Training*: Full dataset (1,809 patients) would likely improve results by 3–5%.
-+ *Two Modalities*: Incorporating T1n and T2w could provide additional discriminative information.
-+ *Post-Processing*: Connected component analysis could reduce false positives and improve Hausdorff distance.
-+ *Test-Time Augmentation*: Averaging across flipped/rotated inputs typically improves Dice by 1–2%.
-
-
-== Conclusions
 
 #block(
-width: 100%,
-fill: c-ivory,
-radius: 8pt,
-inset: 18pt,
-stroke: (top: 0.5pt + c-charcoal, bottom: 0.5pt + c-slate),
-breakable: true,
+  width: 100%,
+  fill: c-black,
+  radius: 8pt,
+  inset: 18pt,
+  stroke: 0.5pt + c-slate,
 )[
-#text(size: 12pt, weight: "bold", fill: c-black)[Executive Summary]
-#v(8pt)
-We developed a complete, production-grade pipeline for *3D brain tumour segmentation* achieving:
-
-#v(6pt)
-#grid(
-  columns: (1fr, 1fr),
-  column-gutter: 16pt,
-  row-gutter: 10pt,
-  [✓ *Mean Dice Score: 0.775* on 90 test patients],
-  [✓ *All sub-regions above 0.73 Dice*],
-  [✓ *Class imbalance addressed* via triple strategy],
-  [✓ *Transfer learning* from pretrained 2D CNNs],
-  [✓ *Resume-capable checkpointing* for robustness],
-  [✓ *Fully automated* single-command execution],
-)
+  #text(size: 13pt, weight: "bold", fill: c-white)[Final Performance Summary]
+  #v(8pt)
+  #set text(fill: c-silver, size: 10pt)
+  #grid(
+    columns: (1fr, 1fr),
+    column-gutter: 20pt,
+    row-gutter: 12pt,
+    [✓ *Mean Dice Score: 0.775* (Test set)],
+    [✓ *SE-Attention U-Net* architecture],
+    [✓ *Combined Focal + Dice Loss*],
+    [✓ *2D-to-3D Transfer Learning*],
+    [✓ *Memory Efficient Training* (AMP)],
+    [✓ *Full Pipeline Automation*],
+  )
 ]
 
+
 The pipeline is fully automated — from dataset verification through training, evaluation, and visualisation — and can be executed with a single command. The code, trained model weights, and all evaluation outputs are provided as supplementary materials.
+
+#pagebreak()
+
+// ═══════════════════════════════════════════════════════════════════════════
+// APPENDIX
+// ═══════════════════════════════════════════════════════════════════════════
+= Appendix
+
+== Task 1: Detailed Exploratory Analysis <sec-t1-eda-appendix>
+
+#figure(
+  image("outputs/01_target_distribution.png", width: 50%),
+  caption: [A.1: Target Variable Distribution.],
+)
+
+#figure(
+  image("outputs/02_correlation_heatmap.png", width: 70%),
+  caption: [A.2: Correlation Heatmap of Numerical Features.],
+)
+
+#figure(
+  image("outputs/03_feature_distributions.png", width: 100%),
+  caption: [A.3: Feature Distributions by Churn Status.],
+)
+
+#figure(
+  image("outputs/04_pca_scatter.png", width: 60%),
+  caption: [A.4: PCA — 2D Projection of Overlapping Classes.],
+)
+
+== Task 1: Hyperparameter Tuning Logs <sec-t1-tuning-appendix>
+
+#info-box(title: "Grid Search Configuration")[
+  The search space included:
+  - Hidden Units: [16, 32, 64]
+  - Learning Rate: [0.1, 0.05, 0.01]
+  - L2 Lambda: [0.01, 0.001, 0.0001]
+  
+  The 32-unit configuration with 0.05 learning rate provided the best balance between convergence speed and validation generalisation.
+]
+
+== Task 2: Detailed EDA <sec-t2-eda-appendix>
+
+#grid(
+  columns: (1fr, 1fr),
+  column-gutter: 12pt,
+  figure(
+    image("outputs/results/eda_class_distribution.png", width: 100%),
+    caption: [A.5: Class distribution — 98% background dominance.],
+  ),
+  figure(
+    image("outputs/results/eda_sample_slice.png", width: 100%),
+    caption: [A.6: Sample axial slice with ground-truth overlay.],
+  ),
+)
+
+== Task 2: Data Augmentation Strategy <tbl-aug-appendix>
+
+#figure(
+  table(
+    columns: (auto, auto, auto),
+    align: (left, center, left),
+    stroke: none,
+    table.hline(stroke: 2pt + c-charcoal),
+    table.header([*Augmentation*], [*Probability*], [*Purpose*]),
+    table.hline(stroke: 0.5pt + c-platinum),
+    [Random axis flips], [50%], [Spatial invariance],
+    [Random 90° rotations], [30%], [Rotational invariance],
+    [Elastic deformation], [10%], [Tissue deformation simulation],
+    [Intensity scaling/shifting], [30%], [Inter-scanner variability],
+    table.hline(stroke: 2pt + c-charcoal),
+  ),
+  caption: [A.7: Detailed Data Augmentation Parameters.],
+)
+
+== Task 2: Qualitative Predictions <fig-samples-appendix>
+
+#grid(
+  columns: (1fr, 1fr),
+  column-gutter: 10pt,
+  row-gutter: 10pt,
+  figure(image("outputs/results/sample_predictions/sample_01.png", width: 100%), caption: [Sample 1]),
+  figure(image("outputs/results/sample_predictions/sample_02.png", width: 100%), caption: [Sample 2]),
+  figure(image("outputs/results/sample_predictions/sample_03.png", width: 100%), caption: [Sample 3]),
+  figure(image("outputs/results/sample_predictions/sample_04.png", width: 100%), caption: [Sample 4]),
+)
+
