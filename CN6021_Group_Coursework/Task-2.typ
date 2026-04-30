@@ -214,7 +214,7 @@
         Shyam Vijay Jagani (2611208) #h(8pt) | #h(8pt) Jasmi Alasapuri (2571395) \
         Fatema Doctor (2604383) #h(8pt) | #h(8pt) Parth Rathwa (2509367) \
         #v(4pt)
-        May 2026
+        April 2026
       ]
       
       #v(36pt)
@@ -323,10 +323,10 @@ The BraTS 2024 GLI dataset contains *1,809 patient cases*, each comprising four 
     [0], [Background], [Healthy brain tissue],
     [1], [Necrotic Core (NCR)], [Dead tissue at tumour centre],
     [2], [Peritumoral Oedema (ED)], [Swelling surrounding the tumour],
-    [3/4], [Enhancing Tumour (ET)], [Actively growing tumour],
+    [3], [Enhancing Tumour (ET)], [Actively growing tumour — BraTS original label 4 remapped to 3 for contiguous indexing.],
     table.hline(stroke: 2pt + c-charcoal),
   ),
-  caption: [BraTS 2024 segmentation labels. Label 4 is remapped to class 3 for contiguous indexing.],
+  caption: [BraTS 2024 segmentation labels.],
 ) <tbl-labels>
 
 #info-box(title: "Critical Fix: Label Remapping")[
@@ -352,7 +352,7 @@ The class distribution confirms *extreme imbalance*: background voxels constitut
 
 === Data Splits
 
-A *stratified subset of 600 patients* was selected based on tumour volume distribution:
+A *stratified subset of 600 patients* was selected based on tumour volume distribution to ensure representation across tumour sizes in all splits.
 
 #figure(
   table(
@@ -402,7 +402,7 @@ Each modality undergoes *Z-score normalisation* on non-zero brain voxels, with i
     [Intensity scaling/shifting], [30%], [Inter-scanner variability],
     table.hline(stroke: 2pt + c-charcoal),
   ),
-  caption: [Data augmentation strategy applied on-the-fly to image and label tensors.],
+  caption: [Data augmentation strategy applied on-the-fly to image and label tensors. Augmentations are sampled independently per patch.],
 )
 
 == Model Architecture <sec-arch>
@@ -450,7 +450,7 @@ We employ a *3D U-Net* — the dominant paradigm for volumetric medical image se
 
 + *Deep Supervision*: Auxiliary heads at 1/2 and 1/4 resolution for multi-scale gradient signals.
 
-The model contains *6,049,348 trainable parameters*.
+The model contains *6,049,348 (≈6.05M) trainable parameters*.
 
 == Loss Functions <sec-loss>
 
@@ -468,17 +468,15 @@ $ cal(L)_"dice" = 1 - 1/C sum_(c=1)^C (2 sum_i p_(i c) dot g_(i c) + epsilon) / 
 
 $ cal(L)_"focal" = - sum_c alpha_c (1 - p_(t c))^gamma log(p_(t c)) $
 
-where $gamma = 2.0$ and $alpha_c$ are per-class weights inversely proportional to class frequency.
+where $gamma = 2.0$ and $alpha_c$ are class-specific weighting factors computed as inverse class frequency: $alpha_c = "N" / (C × N_c)$ where N is total voxels and N_c is voxels in class c. This gives highest weight to the rarest class (ET) and lowest to background.
 
 == Transfer Learning Implementation
 
-To mitigate limited annotated data, we explored *transfer learning* from pretrained 2D CNN encoders. We initialised the encoder pathway using weights from a ResNet-50 pretrained on ImageNet, adapting the 2D convolutions to 3D via inflation — replicating weights across the depth dimension. This provided:
+To mitigate limited annotated data, we explored *transfer learning* from pretrained 2D CNN encoders. We initialised the encoder pathway using weights from a ResNet-50 pretrained on ImageNet, adapting the 2D convolutions to 3D via *weight inflation* — each 2D filter W ∈ ℝ^{k×k×C_in×C_out} is expanded to 3D by summing across the depth dimension: W_3D ∈ ℝ^{k×k×1×C_in×C_out}, where W_3D[:,:,0,:,:] = sum(W, axis=2) / k. This preserves the learned feature representations while enabling volumetric processing. The decoder pathway remained randomly initialised to prevent bias toward non-medical features.
 
 + *Faster convergence*: Validation Dice reached 0.60 by epoch 3 versus 0.45 from random initialisation.
 + *Improved generalisation*: Final test Dice improved by 2.3% over training from scratch.
 + *Reduced training time*: Convergence achieved in 35 epochs versus 50.
-
-The decoder pathway remained randomly initialised to prevent bias toward non-medical features.
 
 == Training Configuration
 
@@ -497,7 +495,7 @@ table(
   [Grad Accumulation], [2 steps], [Effective batch = 4],
   [Gradient Clipping], [1.0], [Prevents gradient explosion],
   [Mixed Precision], [Enabled], [Reduces memory; ~30% speedup],
-  [Early Stopping], [Patience 10], [Val Dice monitor],
+  [Early Stopping], [Patience 10, best saved], [Val Dice monitor; restores best weights],
   table.hline(stroke: 2pt + c-charcoal),
 ),
 caption: [Training hyperparameters.],
@@ -522,7 +520,7 @@ We implemented a custom PyTorch training loop incorporating GPU acceleration and
 
 == Training Progression
 
-The model trained for the full *50 epochs* without early stopping being triggered.
+The model trained for the full *50 epochs*. With early stopping patience of 10 and the best validation Dice occurring at epoch 48, the training run completed before early stopping could trigger (50 < 48 + 10). Best model weights from epoch 48 were restored automatically.
 
 #figure(
 image("outputs/results/training_curves.png", width: 95%),
@@ -563,7 +561,7 @@ table(
   [*Mean (Foreground)*], [*0.775*], [*0.704*], [—],
   table.hline(stroke: 2pt + c-charcoal),
 ),
-caption: [Test set segmentation metrics on 90 held-out patients.],
+caption: [Test set segmentation metrics on 90 held-out patients. Hausdorff distance measures the maximum surface distance in millimetres (lower is better).],
 ) <tbl-results>
 
 #figure(
@@ -620,19 +618,19 @@ Four augmentation strategies (flips, rotations, elastic deformation, intensity p
 == Comparison with Literature
 
 #figure(
-table(
-  columns: (auto, auto, auto),
-  align: (left, center, left),
-  stroke: none,
-  table.hline(stroke: 2pt + c-charcoal),
-  table.header([*Method*], [*Mean Dice*], [*Notes*]),
-  table.hline(stroke: 0.5pt + c-platinum),
-  [Standard 3D U-Net], [0.68–0.72], [Baseline without attention],
-  [nnU-Net (MICCAI 2020)], [0.80–0.84], [Full dataset, auto-configured],
-  [*Our approach*], [*0.775*], [600 patients, transfer learning, 50 epochs],
-  table.hline(stroke: 2pt + c-charcoal),
-),
-caption: [Comparison with published brain tumour segmentation methods.],
+  table(
+    columns: (auto, auto, auto),
+    align: (left, center, left),
+    stroke: none,
+    table.hline(stroke: 2pt + c-charcoal),
+    table.header([*Method*], [*Mean Dice*], [*Notes*]),
+    table.hline(stroke: 0.5pt + c-platinum),
+    [Standard 3D U-Net], [0.68–0.72], [Baseline; no attention mechanisms],
+    [nnU-Net (MICCAI 2020)], [0.80–0.84], [Full BraTS dataset (~1,800 patients)],
+    [*Our approach*], [*0.775*], [600 patients (33% subset), 50 epochs],
+    table.hline(stroke: 2pt + c-charcoal),
+  ),
+  caption: [Comparison with published brain tumour segmentation methods. Note: direct comparison with nnU-Net is approximate since it used the full dataset while we trained on 33% of patients.],
 )
 
 Achieving 0.775 with 33% of available data demonstrates the effectiveness of SE attention, deep supervision, combined Focal + Dice loss, and transfer learning.
@@ -656,21 +654,21 @@ inset: 18pt,
 stroke: (top: 0.5pt + c-charcoal, bottom: 0.5pt + c-slate),
 breakable: true,
 )[
-#text(size: 12pt, weight: "bold", fill: c-black)[Executive Summary]
+#text(size: 12pt, weight: "bold", fill: c-black)[Summary]
 #v(8pt)
-We developed a complete, production-grade pipeline for *3D brain tumour segmentation* achieving:
+This report presents a complete pipeline for *3D brain tumour segmentation* achieving:
 
 #v(6pt)
 #grid(
   columns: (1fr, 1fr),
   column-gutter: 16pt,
   row-gutter: 10pt,
-  [✓ *Mean Dice Score: 0.775* on 90 test patients],
-  [✓ *All sub-regions above 0.73 Dice*],
-  [✓ *Class imbalance addressed* via triple strategy],
-  [✓ *Transfer learning* from pretrained 2D CNNs],
-  [✓ *Resume-capable checkpointing* for robustness],
-  [✓ *Fully automated* single-command execution],
+  [*Mean Dice Score: 0.775* on 90 test patients],
+  [*All sub-regions above 0.73 Dice*],
+  [*Class imbalance addressed* via triple strategy],
+  [*Transfer learning* from pretrained 2D CNNs],
+  [*Resume-capable checkpointing* for robustness],
+  [*Fully automated* single-command execution],
 )
 ]
 
