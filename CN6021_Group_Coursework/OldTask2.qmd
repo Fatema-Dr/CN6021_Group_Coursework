@@ -1,7 +1,7 @@
 ---
 title: "Task 2: 3D Brain Tumour Segmentation Using Deep Learning"
 subtitle: "CN6021 — Advanced Topics in AI and Data Science"
-author: "Group [Your Group Name/Number]"   # ← Replace with your group name before submission
+author: "Shyam Vijay Jagani (2611208), Jasmi Alasapuri (2571395), Fatema Doctor (2604383), Parth Rathwa (2509367)"
 date: today
 format:
   pdf:
@@ -97,6 +97,8 @@ Subset selection was performed using a **stratified sampling strategy** based on
 
 
 ## Data Loading and Preprocessing
+
+To efficiently manage and load the 3D MRI scans, we implemented a custom data loading pipeline inheriting from `torch.utils.data.Dataset` and batched via `torch.utils.data.DataLoader`.
 
 ### Patch-Based Sampling
 
@@ -232,9 +234,9 @@ We employ a two-phase learning rate schedule:
 
 Training is monitored via **validation Dice score** with a patience of 10 epochs. If no improvement is observed for 10 consecutive epochs, training terminates early. The best model checkpoint (by validation Dice) is saved separately from the final checkpoint. A **full-state resume system** saves model weights, optimiser state, scheduler state, scaler state, training history, and patience counter after every epoch, allowing interrupted training to resume seamlessly.
 
-### Hardware and Performance
+### Custom Training Loop and Performance
 
-Training was conducted on an **NVIDIA GeForce RTX 3060 Laptop GPU** (6 GB VRAM) under **WSL2** (Windows Subsystem for Linux). Key performance optimisations include:
+We implemented a custom PyTorch training loop incorporating GPU acceleration and efficient memory management to train on an **NVIDIA GeForce RTX 3060 Laptop GPU** (6 GB VRAM) under **WSL2** (Windows Subsystem for Linux). Key performance optimisations include:
 
 - **cuDNN auto-tuning**: Automatically selects the fastest convolution algorithm for the hardware.
 - **8 data-loading workers** with prefetch factor 4: Maintains a queue of 32 pre-processed batches to minimise GPU idle time.

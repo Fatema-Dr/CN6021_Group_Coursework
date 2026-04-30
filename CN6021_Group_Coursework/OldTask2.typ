@@ -158,8 +158,10 @@
       ]
       #v(6pt)
       #text(size: 10pt, fill: luma(120))[
-        // Replace with your group name
-        Group \[Your Group Name\] #h(10pt) | #h(10pt) May 2026
+        Shyam Vijay Jagani (2611208) #h(8pt) | #h(8pt) Jasmi Alasapuri (2571395) \
+        Fatema Doctor (2604383) #h(8pt) | #h(8pt) Parth Rathwa (2509367) \
+        #v(4pt)
+        May 2026
       ]
 
       #v(30pt)

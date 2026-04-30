@@ -1,7 +1,7 @@
 ---
 title: "Task 1: Customer Churn Prediction Using a Shallow Neural Network"
 subtitle: "CN6021 — Advanced Topics in AI and Data Science"
-author: "Group [Your Group Name/Number]"   # ← Replace with your group name before submission
+author: "Shyam Vijay Jagani (2611208), Jasmi Alasapuri (2571395), Fatema Doctor (2604383), Parth Rathwa (2509367)"
 date: today
 format:
   pdf:
