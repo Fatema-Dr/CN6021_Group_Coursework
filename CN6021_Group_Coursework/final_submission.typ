@@ -182,6 +182,8 @@
         Shyam Vijay Jagani (2611208) #h(8pt) | #h(8pt) Jasmi Alasapuri (2571395) \
         Fatema Doctor (2604383) #h(8pt) | #h(8pt) Parth Rathwa (2509367) \
         #v(4pt)
+        *Course Leader:* Dr. Mahmud #h(12pt) | #h(12pt) *Tutor:* Bipash Chattiyal \
+        #v(4pt)
         University of East London \
         May 2026
       ]
